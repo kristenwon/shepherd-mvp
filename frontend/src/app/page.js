@@ -11,9 +11,14 @@ export default function Home() {
               <p className="text-md font-semibold">My Repositories</p>
               <p className="text-[#595959]">Access all your previous repositories and hypotheses.</p>
             </div>
-            <Link href="/new-test">
+            <div className="flex space-x-2">
+              <Link href="/attack-path">
+                <button className="bg-[#4169E1] px-4 py-2 rounded-lg hover:scale-105 text-white">Attack Path</button>
+              </Link>
+              <Link href="/new-test">
                 <button className="bg-[#df153e] px-4 py-2 rounded-lg hover:scale-105">+</button>
-            </Link>
+              </Link>
+            </div>
         </div>
         <div className="bg-[#0C0C0C] p-6 border border-[#232323] rounded-lg">
           <Repositories />
