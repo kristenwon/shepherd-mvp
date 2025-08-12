@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration for MAS repository
-MAS_REPO_PATH = os.environ.get("MAS_REPO_PATH", "../mas")
+MAS_REPO_PATH = os.environ.get("MAS_REPO_PATH", "../blackRabbit")
 MAS_PYTHON_PATH = os.environ.get("MAS_PYTHON_PATH", "python")
 
 # Global state for tracking output patterns
@@ -69,9 +69,11 @@ class PromptDetector:
         
         return False
     
+    # Add these patterns to your PromptDetector class
+
     def is_likely_prompt(self, line: str) -> bool:
         """Check if this line is likely a prompt for user input"""
-        if not line or len(line) > 300:  # Increased limit for longer prompts
+        if not line or len(line) > 300:
             return False
         
         line_lower = line.lower().strip()
@@ -97,10 +99,24 @@ class PromptDetector:
             r'Enter the specific function.*:$',  # Your function prompt
             r'Enter hypothesis.*:$',  # Your hypothesis prompt
             r'Enter your detailed vulnerability hypothesis.*:$',  # Your detailed prompt
+            r'\nRun another MAS\?.*:$',  # NEW: Catch "Run another MAS? (y/N):" prompt
         ]
         
         # Check MAS-specific patterns first
         for pattern in mas_prompt_patterns:
+            if re.search(pattern, line_stripped, re.IGNORECASE):
+                return True
+        
+        # Check for yes/no prompts specifically
+        yes_no_patterns = [
+            r'.*\(y/n\)\s*:?\s*$',  # Matches (y/n) at end
+            r'.*\(Y/N\)\s*:?\s*$',  # Matches (Y/N) at end
+            r'.*\(yes/no\)\s*:?\s*$',  # Matches (yes/no) at end
+            r'.*\[y/n\]\s*:?\s*$',  # Matches [y/n] at end
+            r'.*\[Y/N\]\s*:?\s*$',  # Matches [Y/N] at end
+        ]
+        
+        for pattern in yes_no_patterns:
             if re.search(pattern, line_stripped, re.IGNORECASE):
                 return True
         
@@ -123,6 +139,9 @@ class PromptDetector:
             r'^Do you\s+', # Starts with Do you
             r'^Would you\s+', # Starts with Would you
             r'^Specify\s+', # Starts with Specify
+            r'^Run\s+',    # NEW: Starts with Run
+            r'^Continue\s+', # NEW: Starts with Continue
+            r'^Restart\s+', # NEW: Starts with Restart
         ]
         
         # Check patterns
@@ -135,8 +154,8 @@ class PromptDetector:
                     # Avoid matching "Step 1:" or "100%:" etc
                     if re.match(r'^(Step\s+)?\d+$', text_before) or re.match(r'^\d+%$', text_before):
                         return False
-                    # But DO match prompts with parentheses like "Enter the contract name (e.g., Vault, BuyPurpose):"
-                    if "enter" in text_before.lower() or "input" in text_before.lower():
+                    # But DO match prompts with parentheses
+                    if "enter" in text_before.lower() or "input" in text_before.lower() or "run" in text_before.lower():
                         return True
                 return True
         
@@ -203,6 +222,8 @@ class OutputBuffer:
         self.hold_buffer = ""  # Buffer for holding potential prompts
         self.last_newline_sent = True
         
+# In the OutputBuffer class, update the add_char method:
+
     async def add_char(self, char: str):
         """Add a character and manage buffering"""
         self.buffer += char
@@ -211,16 +232,44 @@ class OutputBuffer:
             # We have a complete line
             line = self.buffer.strip()
             
-            # Special check for hypothesis prompts
-            hypothesis_patterns = [
-                "Enter hypothesis (press Enter twice when done):",
-                "Enter your detailed vulnerability hypothesis"
+            # Special check for the "Run another MAS?" prompt
+            # This prompt might come after a newline, so check recent context
+            run_another_patterns = [
+                "run another mas?",
+                "▶️  run another mas?",
+                "▶  run another mas?",  # Without emoji variant selector
+                "run another mas? (y/n)",
             ]
             
-            is_hypothesis_prompt = any(pattern in line for pattern in hypothesis_patterns)
+            is_run_another_prompt = any(
+                pattern in line.lower() for pattern in run_another_patterns
+            )
             
-            # Check if this line looks like a prompt (including hypothesis prompts)
-            if self.detector.is_likely_prompt(line) or is_hypothesis_prompt:
+            # Special check for hypothesis prompts and related lines
+            hypothesis_patterns = [
+                "Enter hypothesis (press Enter twice when done):",
+                "Enter your detailed vulnerability hypothesis",
+                "Example: 'This function allows",
+                "Example:",
+                "(2-3 lines):",
+            ]
+            
+            # Also check if this is part of a multi-line prompt sequence
+            is_hypothesis_related = any(pattern in line for pattern in hypothesis_patterns)
+            
+            # Check if recent lines contained hypothesis prompt indicators
+            recent_has_hypothesis = False
+            if len(self.detector.recent_lines) > 0:
+                for recent in self.detector.recent_lines[-3:]:
+                    if any(pattern in recent for pattern in ["Enter hypothesis", "vulnerability hypothesis"]):
+                        recent_has_hypothesis = True
+                        break
+            
+            # If this line is a prompt, hold it
+            if (self.detector.is_likely_prompt(line) or 
+                is_hypothesis_related or 
+                is_run_another_prompt or  # Added this condition
+                (recent_has_hypothesis and line.startswith("Example:"))):
                 # Hold this line - don't send it yet
                 self.hold_buffer = self.buffer
                 self.buffer = ""
@@ -238,6 +287,13 @@ class OutputBuffer:
         else:
             # Still building a line
             self.last_newline_sent = False
+            
+            # Check if we're building the "Run another MAS?" prompt
+            # This prompt might come character by character
+            buffer_lower = self.buffer.lower()
+            if ("run another mas" in buffer_lower or "▶" in self.buffer):
+                # We might be building this prompt, don't send yet
+                return
             
             # If buffer is getting large and we have no held content, send it
             if len(self.buffer) > 200 and not self.hold_buffer:
