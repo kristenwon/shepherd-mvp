@@ -196,14 +196,55 @@ class RunManager:
             return False
     
     async def get_system_status(self) -> dict:
-        """Get current system status"""
+        """Get current system status with detailed run information"""
         async with self._lock:
+            # Get active runs with details
+            active_runs_info = []
+            for run_id, run_data in self.active_runs.items():
+                active_runs_info.append({
+                    "run_id": run_id,
+                    "status": run_data["status"],
+                    "started_at": run_data["started_at"],
+                    "github_url": run_data["job_data"].get("github_url") if "job_data" in run_data else None
+                })
+            
+            # Get queued runs with details
+            queued_runs_info = []
+            for run in self.queued_runs:
+                queued_runs_info.append({
+                    "run_id": run["run_id"],
+                    "status": run["status"],
+                    "queued_at": run["queued_at"],
+                    "queue_position": run["queue_position"],
+                    "github_url": run["job_data"].get("github_url") if "job_data" in run else None
+                })
+            
+            # Get recently completed runs (optional - last 5)
+            recent_completed = []
+            # Sort completed runs by completed_at timestamp and get last 5
+            sorted_completed = sorted(
+                self.completed_runs.items(),
+                key=lambda x: x[1].get("completed_at", ""),
+                reverse=True
+            )[:5]
+            
+            for run_id, run_data in sorted_completed:
+                recent_completed.append({
+                    "run_id": run_id,
+                    "status": run_data["status"],
+                    "completed_at": run_data.get("completed_at"),
+                    "github_url": run_data["job_data"].get("github_url") if "job_data" in run_data else None
+                })
+            
             return {
                 "max_concurrent": self.max_concurrent,
-                "active_runs": len(self.active_runs),
-                "queued_runs": len(self.queued_runs),
+                "active_runs_count": len(self.active_runs),
+                "queued_runs_count": len(self.queued_runs),
                 "available_slots": self.max_concurrent - len(self.active_runs),
-                "status": "at_capacity" if len(self.active_runs) >= self.max_concurrent else "available"
+                "system_status": "at_capacity" if len(self.active_runs) >= self.max_concurrent else "available",
+                "active_runs": active_runs_info,
+                "queued_runs": queued_runs_info,
+                "recent_completed": recent_completed
             }
     
     async def get_queue_status(self, run_id: str) -> dict:
