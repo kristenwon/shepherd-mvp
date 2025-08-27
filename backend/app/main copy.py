@@ -13,7 +13,6 @@ import signal
 import subprocess
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi.middleware.cors import CORSMiddleware
 
 from .ws_manager import WebSocketManager
 from .mas_bridge_tags_output import launch_mas_interactive, create_ws_input_handler
@@ -29,19 +28,10 @@ async def lifespan(app: FastAPI):
         print("🧹 Cleaning up orphaned processes from previous session...")
         run_manager.load_orphaned_pids()
     
-    # Set run manager reference in WebSocketManager
-    ws_manager.set_run_manager(run_manager)
-    
-    # Start idle connection monitor
-    await ws_manager.start_idle_monitor()
-    
     yield  # Server runs here
     
     # === SHUTDOWN ===
     print("\n🛑 Shutting down Shepherd service...")
-    
-    # Stop idle monitor
-    await ws_manager.stop_idle_monitor()
     
     # Kill all currently running MAS processes
     if run_manager.process_pids:
@@ -56,15 +46,7 @@ async def lifespan(app: FastAPI):
     
     print("👋 Shutdown complete!")
 
-
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Or specify your domains
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 ws_manager = WebSocketManager()
 
 # Store input queues for each run
@@ -671,14 +653,12 @@ async def get_run_status(run_id: str):
         "queue_position": queue_status.get("queue_position")
     })
 
-# Update the WebSocket endpoint to track activity
 @app.websocket("/ws/{run_id}")
 async def run_logs_ws(ws: WebSocket, run_id: str):
     """
     WebSocket endpoint for bidirectional communication with MAS.
     - Sends MAS output and prompts to client
     - Receives user input from client
-    - Tracks activity for idle timeout
     - Closes itself when run is cancelled
     """
     await ws_manager.connect(run_id, ws)
@@ -687,9 +667,6 @@ async def run_logs_ws(ws: WebSocket, run_id: str):
         while True:
             # Wait for messages from client
             data = await ws.receive_text()
-            
-            # Update activity timestamp when receiving data
-            await ws_manager.receive_activity(run_id)
             
             try:
                 message = json.loads(data)
@@ -708,11 +685,9 @@ async def run_logs_ws(ws: WebSocket, run_id: str):
                             "data": "Run not found or not ready for input"
                         })
                 
-                # Handle ping messages (keep-alive)
+                # Handle other message types if needed
                 elif message.get("type") == "ping":
                     await ws.send_json({"type": "pong"})
-                    # Ping counts as activity
-                    await ws_manager.receive_activity(run_id)
                     
             except json.JSONDecodeError:
                 await ws.send_json({
@@ -728,23 +703,6 @@ async def run_logs_ws(ws: WebSocket, run_id: str):
     except Exception as e:
         print(f"WebSocket error for run {run_id}: {e}")
         ws_manager.disconnect(run_id, ws)
-
-# Add a new endpoint to check idle status
-@app.get("/system/idle-status")
-async def get_idle_status():
-    """Get idle status for all active WebSocket connections"""
-    idle_status = ws_manager.get_idle_status()
-    return {
-        "idle_timeout_seconds": ws_manager.IDLE_TIMEOUT_SECONDS,
-        "runs": idle_status
-    }
-
-# # Optional: Add endpoint to manually reset activity for a run
-# @app.post("/runs/{run_id}/keep-alive")
-# async def keep_alive(run_id: str):
-#     """Reset the idle timer for a specific run"""
-#     await ws_manager.receive_activity(run_id)
-#     return {"success": True, "message": f"Activity updated for run {run_id}"}
 
 @app.websocket("/echo/{run_id}")
 async def _echo(ws: WebSocket, run_id: str):
