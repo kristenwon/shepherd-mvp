@@ -13,7 +13,7 @@ class WebSocketManager:
     • Tracks idle time and auto-cancels after timeout
     """
     MAX_BUFFER = 2000         # keep last 2000 log msgs ≈ a few MB total
-    IDLE_TIMEOUT_SECONDS = 60  # 10 minutes = 600 seconds
+    IDLE_TIMEOUT_SECONDS = 1200  # 10 minutes = 600 seconds
 
     def __init__(self) -> None:
         self._conns: Dict[str, Set[WebSocket]] = defaultdict(set)
