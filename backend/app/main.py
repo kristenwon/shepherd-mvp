@@ -628,8 +628,8 @@ async def health_check():
 
 @app.get("/settings")
 async def settings():
-    return {"MAX_CONCURRENT_RUNS": int(os.getenv("MAX_CONCURRENT_RUNS")), 
-            "IDLE_TIMEOUT_SECONDS": int(os.getenv("IDLE_TIMEOUT_SECONDS"))}
+    return {"MAX_CONCURRENT_RUNS": os.getenv("MAX_CONCURRENT_RUNS"), 
+            "IDLE_TIMEOUT_SECONDS": os.getenv("IDLE_TIMEOUT_SECONDS")}
 
 
 if __name__ == "__main__":
