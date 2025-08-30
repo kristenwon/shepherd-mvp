@@ -882,21 +882,12 @@ async def launch_mas_interactive(
                 buffer += char
                 line_buffer += char
                 
-                
-                # Process character through output buffer
-                if error_state:
-                    # In error state, send directly
-                    log_file.write(char)
-                    log_file.flush()
-                    print(char, end='', flush=True)
-                    all_output.append(char)
-                else:
-                    # Normal flow - use output buffer with tag processing
-                    await output_buffer.add_char(char)
-                    log_file.write(char)
-                    log_file.flush()
-                    print(char, end='', flush=True)
-                    all_output.append(char)
+                # Normal flow - use output buffer with tag processing
+                await output_buffer.add_char(char)
+                log_file.write(char)
+                log_file.flush()
+                print(char, end='', flush=True)
+                all_output.append(char)
                 
                 # Handle newlines for buffer management
                 if char == '\n':
