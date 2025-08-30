@@ -18,6 +18,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from .ws_manager import WebSocketManager
 from .mas_bridge_tags_output import launch_mas_interactive, create_ws_input_handler
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
+from dotenv import load_dotenv
+
+load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -48,7 +51,7 @@ async def lifespan(app: FastAPI):
         print(f"   Killing {len(run_manager.process_pids)} active MAS processes...")
         for run_id, pid in run_manager.process_pids.items():
             run_manager.kill_process(pid)
-            print(f"   ✓ Killed process {pid} for run {run_id[:8]}")
+            print(f"   ✔ Killed process {pid} for run {run_id[:8]}")
     
     # Clean up PID file
     if run_manager.pid_file.exists():
@@ -87,27 +90,31 @@ class RepositoryUpdateRequest(BaseModel):
     environment: Optional[str] = None
     reference_files: Optional[List[str]] = None
 
-# Enums and Classes for Queue Management
+# Enums and Classes for Run Management
 class RunStatus(str, Enum):
-    QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 class RunManager:
-    """Manages concurrent runs and queuing"""
-    def __init__(self, max_concurrent: int = 3):
-        self.max_concurrent = max_concurrent
+    """Simplified run manager - only tracks active runs, no queuing"""
+    def __init__(self):
+        self.max_concurrent = int(os.getenv("MAX_CONCURRENT_RUNS"))
         self.active_runs: Dict[str, dict] = {}
-        self.queued_runs: List[dict] = []
         self.completed_runs: Dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self.process_pids: Dict[str, int] = {}
         self.pid_file = Path("./backend/logs/active_pids.json")
         self.load_orphaned_pids()  # Call cleanup on init
+        
+    async def can_start_run(self) -> bool:
+        """Check if we can start a new run"""
+        async with self._lock:
+            return len(self.active_runs) < self.max_concurrent
+    
     async def add_run(self, run_id: str, job_data: dict) -> dict:
-        """Add a new run, either starting it or queuing it"""
+        """Add a new run if capacity is available"""
         async with self._lock:
             if len(self.active_runs) < self.max_concurrent:
                 # Start immediately
@@ -119,102 +126,42 @@ class RunManager:
                 }
                 return {"status": "started", "run_id": run_id}
             else:
-                # Queue the run
-                queue_position = len(self.queued_runs) + 1
-                queued_run = {
-                    "run_id": run_id,
-                    "status": RunStatus.QUEUED,
-                    "queued_at": datetime.utcnow().isoformat(),
-                    "queue_position": queue_position,
-                    "job_data": job_data
+                # At capacity
+                return {
+                    "status": "at_capacity",
+                    "message": "At capacity, please come back and try again."
                 }
-                self.queued_runs.append(queued_run)
-                return {"status": "queued", "run_id": run_id, "queue_position": queue_position}
     
     async def complete_run(self, run_id: str, success: bool = True):
-        """Mark a run as completed and start next queued run if any"""
+        """Mark a run as completed"""
         async with self._lock:
             if run_id in self.active_runs:
                 run_data = self.active_runs.pop(run_id)
                 run_data["status"] = RunStatus.COMPLETED if success else RunStatus.FAILED
                 run_data["completed_at"] = datetime.utcnow().isoformat()
                 self.completed_runs[run_id] = run_data
-                
-                # Start next queued run if any
-                if self.queued_runs:
-                    next_run = self.queued_runs.pop(0)
-                    next_run_id = next_run["run_id"]
-                    
-                    # Update queue positions for remaining queued runs
-                    for i, run in enumerate(self.queued_runs):
-                        run["queue_position"] = i + 1
-                    
-                    # Start the next run
-                    self.active_runs[next_run_id] = {
-                        "run_id": next_run_id,
-                        "status": RunStatus.RUNNING,
-                        "started_at": datetime.utcnow().isoformat(),
-                        "job_data": next_run["job_data"]
-                    }
-                    
-                    # Notify via WebSocket that the run has started
-                    if ws_manager:
-                        await ws_manager.send_log(next_run_id, {
-                            "type": "status_change",
-                            "data": {"status": "started", "message": "Run started from queue"}
-                        })
-                    
-                    # Return the next run to be started
-                    return next_run
-        return None
     
     async def cancel_run(self, run_id: str) -> bool:
-        """Cancel a run (either active or queued)"""
+        """Cancel an active run"""
         async with self._lock:
             if run_id in self.process_pids:
                 pid = self.process_pids[run_id]
                 if self.kill_process(pid):
                     print(f"Killed process {pid} for run {run_id[:8]}")
                 self.unregister_process(run_id)
+            
             # Check if it's an active run
             if run_id in self.active_runs:
                 run_data = self.active_runs.pop(run_id)
                 run_data["status"] = RunStatus.CANCELLED
                 run_data["cancelled_at"] = datetime.utcnow().isoformat()
                 self.completed_runs[run_id] = run_data
-                
-                # Start next queued run if any
-                if self.queued_runs:
-                    next_run = self.queued_runs.pop(0)
-                    if next_run:
-                        next_run_id = next_run["run_id"]
-                        # Update queue positions
-                        for i, run in enumerate(self.queued_runs):
-                            run["queue_position"] = i + 1
-                        # Start the next run
-                        self.active_runs[next_run_id] = {
-                            "run_id": next_run_id,
-                            "status": RunStatus.RUNNING,
-                            "started_at": datetime.utcnow().isoformat(),
-                            "job_data": next_run["job_data"]
-                        }
-                        # Schedule the queued run to start
-                        asyncio.create_task(start_queued_run(next_run))
                 return True
-            
-            # Check if it's a queued run
-            for i, run in enumerate(self.queued_runs):
-                if run["run_id"] == run_id:
-                    self.queued_runs.pop(i)
-                    # Update queue positions
-                    for j, remaining_run in enumerate(self.queued_runs[i:], start=i):
-                        remaining_run["queue_position"] = j + 1
-                    return True
             
             return False
     
     async def get_system_status(self) -> dict:
-        """Get current system status with detailed run information"""
+        """Get current system status with active runs information"""
         async with self._lock:
             # Get active runs with details
             active_runs_info = []
@@ -224,17 +171,6 @@ class RunManager:
                     "status": run_data["status"],
                     "started_at": run_data["started_at"],
                     "github_url": run_data["job_data"].get("github_url") if "job_data" in run_data else None
-                })
-            
-            # Get queued runs with details
-            queued_runs_info = []
-            for run in self.queued_runs:
-                queued_runs_info.append({
-                    "run_id": run["run_id"],
-                    "status": run["status"],
-                    "queued_at": run["queued_at"],
-                    "queue_position": run["queue_position"],
-                    "github_url": run["job_data"].get("github_url") if "job_data" in run else None
                 })
             
             # Get recently completed runs (optional - last 5)
@@ -257,29 +193,18 @@ class RunManager:
             return {
                 "max_concurrent": self.max_concurrent,
                 "active_runs_count": len(self.active_runs),
-                "queued_runs_count": len(self.queued_runs),
                 "available_slots": self.max_concurrent - len(self.active_runs),
                 "system_status": "at_capacity" if len(self.active_runs) >= self.max_concurrent else "available",
                 "active_runs": active_runs_info,
-                "queued_runs": queued_runs_info,
                 "recent_completed": recent_completed
             }
     
-    async def get_queue_status(self, run_id: str) -> dict:
+    async def get_run_status(self, run_id: str) -> dict:
         """Get status of a specific run"""
         async with self._lock:
             # Check active runs
             if run_id in self.active_runs:
                 return {"run_id": run_id, "status": "running"}
-            
-            # Check queued runs
-            for run in self.queued_runs:
-                if run["run_id"] == run_id:
-                    return {
-                        "run_id": run_id,
-                        "status": "queued",
-                        "queue_position": run["queue_position"]
-                    }
             
             # Check completed runs
             if run_id in self.completed_runs:
@@ -362,64 +287,28 @@ class RunManager:
         except (OSError, ProcessLookupError):
             # Process already dead
             return True
-# Initialize the run manager
-run_manager = RunManager(max_concurrent=3)
 
-# Helper function for starting queued runs
-async def start_queued_run(queued_run: dict):
-    """Start a previously queued run"""
-    run_id = queued_run["run_id"]
-    job_data = queued_run["job_data"]
-    
-    # Create input queue for this run
-    input_queues[run_id] = asyncio.Queue()
-    
-    # Create the WebSocket-based input handler
-    input_handler = create_ws_input_handler(run_id, input_queues[run_id])
-    
-    # Start the run
-    try:
-        result = await launch_mas_interactive(
-            run_id=run_id,
-            job=job_data,
-            input_handler=input_handler,
-            ws_manager=ws_manager,
-            log_dir="./backend/logs"
-        )
-        success = result.get("success", False)
-    except Exception as e:
-        print(f"Error in queued run {run_id}: {e}")
-        success = False
-    finally:
-        # Mark as complete and potentially start next queued run
-        next_run = await run_manager.complete_run(run_id, success)
-        
-        # Clean up input queue
-        if run_id in input_queues:
-            del input_queues[run_id]
-        
-        # If there's another queued run, start it
-        if next_run:
-            await start_queued_run(next_run)
+# Initialize the run manager
+run_manager = RunManager()
 
 # System Status Endpoints
 @app.get("/system/status")
 async def get_system_status():
-    """Get current system status including active and queued runs"""
+    """Get current system status including active runs"""
     status = await run_manager.get_system_status()
     return status
 
-@app.get("/runs/{run_id}/queue-status")
-async def get_queue_status(run_id: str):
-    """Get queue status for a specific run"""
-    status = await run_manager.get_queue_status(run_id)
+@app.get("/runs/{run_id}/status")
+async def get_run_status(run_id: str):
+    """Check status for a specific run"""
+    status = await run_manager.get_run_status(run_id)
     if status["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Run not found")
     return status
 
 @app.delete("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str):
-    """Cancel a run (either active or queued) and notify WebSocket connections to close"""
+    """Cancel an active run and notify WebSocket connections to close"""
     success = await run_manager.cancel_run(run_id)
     
     if success:
@@ -594,12 +483,12 @@ async def delete_repository_analysis_endpoint(run_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete repository analysis: {str(e)}")
 
-# Run Management Endpoint (WITH QUEUE SUPPORT)
+# Run Management Endpoint (WITHOUT QUEUE - JUST CAPACITY CHECK)
 @app.post("/runs/{run_id}")
 async def start_run(run_id: str, job: JobRequest, tasks: BackgroundTasks):
-    """Kick off MAS in the background with WebSocket-based interaction and queue management."""
+    """Kick off MAS in the background with WebSocket-based interaction - no queuing."""
     
-    # Add run to manager (will either start or queue it)
+    # Add run to manager (will either start or return at_capacity)
     result = await run_manager.add_run(run_id, job.dict())
     
     if result["status"] == "started":
@@ -627,16 +516,12 @@ async def start_run(run_id: str, job: JobRequest, tasks: BackgroundTasks):
                 success = False
             finally:
                 run_manager.unregister_process(run_id)
-                # Mark as complete and potentially start next queued run
-                next_run = await run_manager.complete_run(run_id, success)
+                # Mark as complete
+                await run_manager.complete_run(run_id, success)
                 
                 # Clean up input queue
                 if run_id in input_queues:
                     del input_queues[run_id]
-                
-                # If there's a next run to start, do it
-                if next_run:
-                    await start_queued_run(next_run)
         
         # Start MAS in background
         tasks.add_task(run_with_completion)
@@ -646,30 +531,14 @@ async def start_run(run_id: str, job: JobRequest, tasks: BackgroundTasks):
             "run_id": run_id
         }, status_code=202)
     
-    elif result["status"] == "queued":
+    elif result["status"] == "at_capacity":
         return JSONResponse({
-            "status": "queued",
-            "run_id": run_id,
-            "queue_position": result["queue_position"],
-            "message": f"Run queued at position {result['queue_position']}"
-        }, status_code=202)
+            "status": "at_capacity",
+            "message": result["message"]
+        }, status_code=503)  # 503 Service Unavailable
     
     else:
         raise HTTPException(status_code=500, detail="Unexpected status from run manager")
-
-@app.get("/runs/{run_id}/status")
-async def get_run_status(run_id: str):
-    """Check if a run is active and ready for input."""
-    is_active = run_id in input_queues
-    queue_status = await run_manager.get_queue_status(run_id)
-    
-    return JSONResponse({
-        "run_id": run_id,
-        "active": is_active,
-        "ready_for_input": is_active,
-        "status": queue_status["status"],
-        "queue_position": queue_status.get("queue_position")
-    })
 
 # Update the WebSocket endpoint to track activity
 @app.websocket("/ws/{run_id}")
@@ -739,13 +608,6 @@ async def get_idle_status():
         "runs": idle_status
     }
 
-# # Optional: Add endpoint to manually reset activity for a run
-# @app.post("/runs/{run_id}/keep-alive")
-# async def keep_alive(run_id: str):
-#     """Reset the idle timer for a specific run"""
-#     await ws_manager.receive_activity(run_id)
-#     return {"success": True, "message": f"Activity updated for run {run_id}"}
-
 @app.websocket("/echo/{run_id}")
 async def _echo(ws: WebSocket, run_id: str):
     """Simple echo endpoint for testing WebSocket connectivity."""
@@ -763,6 +625,11 @@ async def _echo(ws: WebSocket, run_id: str):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "shepherd-mvp"}
+
+@app.get("/settings")
+async def settings():
+    return {"MAX_CONCURRENT_RUNS": int(os.getenv("MAX_CONCURRENT_RUNS")), 
+            "IDLE_TIMEOUT_SECONDS": int(os.getenv("IDLE_TIMEOUT_SECONDS"))}
 
 
 if __name__ == "__main__":

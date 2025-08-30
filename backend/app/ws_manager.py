@@ -1,10 +1,12 @@
 # ws_manager.py
-import asyncio
+import asyncio, os
 from collections import defaultdict, deque
 from typing import Dict, Set, Optional
 from fastapi import WebSocket
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
+load_dotenv()
 class WebSocketManager:
     """
     WebSocket manager with idle tracking and auto-cancellation
@@ -13,7 +15,7 @@ class WebSocketManager:
     • Tracks idle time and auto-cancels after timeout
     """
     MAX_BUFFER = 2000         # keep last 2000 log msgs ≈ a few MB total
-    IDLE_TIMEOUT_SECONDS = 1200  # 10 minutes = 600 seconds
+    IDLE_TIMEOUT_SECONDS = int(os.getenv("IDLE_TIMEOUT_SECONDS")) # 10 minutes = 600 seconds
 
     def __init__(self) -> None:
         self._conns: Dict[str, Set[WebSocket]] = defaultdict(set)

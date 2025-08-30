@@ -9,10 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Initialize Supabase client
-# SUPABASE_URL = os.getenv("SUPABASE_URL")
-# SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_URL = "https://yxspjssdqbswsgotraag.supabase.co/"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl4c3Bqc3NkcWJzd3Nnb3RyYWFnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTM2OTczMTksImV4cCI6MjA2OTI3MzMxOX0.X0U6d6klPowS7lt7eYdD35X8HPH2T-RJrhg7hsRGcfw"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing Supabase credentials in environment variables")
 
