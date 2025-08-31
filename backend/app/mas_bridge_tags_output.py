@@ -871,12 +871,6 @@ async def launch_mas_interactive(
                 # Decode character
                 char = data.decode('utf-8', errors='ignore')
                 
-                # Check for error state
-                if "GRAPH_RECURSION_LIMIT" in "".join(all_output[-500:]):
-                    if not error_state:
-                        print(f"[DEBUG] ENTERING ERROR STATE - detected GRAPH_RECURSION_LIMIT")
-                    error_state = True
-                    output_buffer.error_state = True
                 
                 # Always accumulate buffer
                 buffer += char
