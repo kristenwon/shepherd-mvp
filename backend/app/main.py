@@ -14,11 +14,10 @@ import subprocess
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
-from .utils import save_email_to_firestore
+
 from .ws_manager import WebSocketManager
 from .mas_bridge_tags_output import launch_mas_interactive, create_ws_input_handler
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
-from .models.waitlist import WaitlistRequest
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -507,8 +506,7 @@ async def start_run(run_id: str, job: JobRequest, tasks: BackgroundTasks):
                     job=job.dict(),
                     input_handler=input_handler,
                     ws_manager=ws_manager,
-                    log_dir="./backend/logs",
-                    input_queues=input_queues
+                    log_dir="./backend/logs"
                 )
                 if 'pid' in result:
                     run_manager.register_process(run_id, result['pid'])
@@ -633,13 +631,6 @@ async def settings():
     return {"MAX_CONCURRENT_RUNS": os.getenv("MAX_CONCURRENT_RUNS"), 
             "IDLE_TIMEOUT_SECONDS": os.getenv("IDLE_TIMEOUT_SECONDS")}
 
-@app.post("/save-waitlist-email")
-async def save_waitlist_email(payload: WaitlistRequest):
-    try:
-        save_email_to_firestore(payload.email)
-        return {"success": True, "message": "Email saved to waitlist"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save email: {str(e)}")
-    
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
