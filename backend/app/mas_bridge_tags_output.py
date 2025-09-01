@@ -225,8 +225,6 @@ class PromptDetector:
             return False
         
         line_lower = line.lower().strip()
-        # if "run another mas?" in line_lower:
-        #     return True
         if "press enter twice" in line_lower:
             return False
         
@@ -585,6 +583,7 @@ async def launch_mas_interactive(
     input_handler: Callable,
     ws_manager=None,
     log_dir: str = "./backend/logs",
+    input_queues: Dict[str, asyncio.Queue] = None,
 ) -> Dict[str, Any]:
     """
     Launch MAS subprocess with tag-based streaming and error handling
@@ -737,7 +736,7 @@ async def launch_mas_interactive(
                                     
                                     # Special handling for "Run another MAS?"
                                     if "Run another MAS?" in prompt_text:
-                                        if user_input.lower() in ['y', 'yes']:
+                                        if user_input.lower() in ['y']:
                                             output_buffer.reset_for_new_mas()
                                             detector.seen_prompts.clear()
                                             print("[SHEPHERD] User chose to run another MAS, state reset")
@@ -913,7 +912,6 @@ async def launch_mas_interactive(
                     "success": return_code == 0
                 }
             })
-        
         return {
             "success": return_code == 0,
             "exit_code": return_code,
@@ -936,8 +934,7 @@ async def launch_mas_interactive(
                     "error": str(e),
                     "traceback": traceback.format_exc()
                 }
-            })
-        
+            })         
         return {
             "success": False,
             "error": str(e),
