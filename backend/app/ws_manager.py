@@ -121,6 +121,21 @@ class WebSocketManager:
             # Clean up buffers if no connections
             if run_id in self._buffers:
                 del self._buffers[run_id]
+                # Cancel the run if no clients are connected
+            if self._run_manager:
+                asyncio.create_task(self._cancel_orphaned_run(run_id))
+    
+    async def _cancel_orphaned_run(self, run_id: str):
+        """Cancel a run that has no connected clients"""
+        await asyncio.sleep(5)  # Give 5 seconds grace period for reconnection
+        
+        # Check again if still no connections
+        if run_id not in self._conns or not self._conns[run_id]:
+            print(f"🚫 Cancelling orphaned run {run_id[:8]} (no connected clients)")
+            if self._run_manager:
+                success = await self._run_manager.cancel_run(run_id)
+                if success:
+                    print(f"✅ Successfully cancelled orphaned run {run_id[:8]}")
 
     async def send_log(self, run_id: str, message: dict):
         """Send a log message to all connected clients for a run"""
@@ -135,7 +150,6 @@ class WebSocketManager:
             for ws in self._conns[run_id]:
                 try:
                     await ws.send_json(message)
-                    
                     # If this is a cancellation message, schedule the connection to close
                     if (message.get("type") == "run_cancelled" and 
                         message.get("data", {}).get("action") == "close_connection"):
