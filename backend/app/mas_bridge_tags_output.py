@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
-
+from .utils import save_hypothesis_to_firestore
 load_dotenv()
 
 # Configuration for MAS repository
@@ -54,6 +54,7 @@ class TagParser:
         'VALIDATOR': r'<<<VALIDATOR>>>(.*?)<<<END_VALIDATOR>>>',
         'SUMMARY': r'<<<SUMMARY>>>(.*?)<<<END_SUMMARY>>>',
         'DESCRIPTION': r'<<<DESCRIPTION>>>(.*?)<<<END_DESCRIPTION>>>',
+        'PLANNER_STEP': r'<<<PLANNER_STEP>>>(.*?)<<<END_PLANNER_STEP>>>',
     }
     
     def __init__(self):
@@ -707,7 +708,8 @@ async def launch_mas_interactive(
                         print(f"[SHEPHERD] Processing USER_INPUT prompt: {prompt_text}")
                         
                         # Check if this is a hypothesis prompt and mark it
-                        if "hypothesis" in prompt_text.lower():
+                        is_hypothesis = "hypothesis" in prompt_text.lower()
+                        if is_hypothesis:
                             output_buffer.handled_hypothesis_via_tag = True
                             # Add to seen prompts to prevent legacy detection
                             detector.seen_prompts.add("hypothesis_silent_wait")
@@ -721,6 +723,13 @@ async def launch_mas_interactive(
                         user_input = await input_handler(prompt_text)
                         
                         if user_input is not None:
+                            if is_hypothesis:
+                                try:
+                                    from .utils import save_hypothesis_to_firestore
+                                    save_hypothesis_to_firestore(run_id, user_input)
+                                    print(f"[SHEPHERD] Saved hypothesis to Firebase for run {run_id}")
+                                except Exception as e:
+                                    print(f"[SHEPHERD] Failed to save hypothesis to Firebase: {e}")
                             try:
                                 if process.returncode is None:
                                     # Send the input to the process
