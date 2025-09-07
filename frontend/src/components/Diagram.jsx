@@ -3,23 +3,63 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import cytoscape from "cytoscape";
 
-// singleton WS by URL
+/* ---------------- singleton WS by URL ---------------- */
 function getSingletonWS(url) {
     if (typeof window === "undefined") return new WebSocket(url);
     const pool = (window.__masWsPool ||= new Map());
     const existing = pool.get(url);
-    if (existing && existing.readyState < 2) return existing;
+    if (existing && existing.readyState < 2) return existing; // CONNECTING or OPEN
     const ws = new WebSocket(url);
     pool.set(url, ws);
-    ws.addEventListener("close", () => { if (pool.get(url) === ws) pool.delete(url); });
+    ws.addEventListener("close", () => {
+        if (pool.get(url) === ws) pool.delete(url);
+    });
     return ws;
     }
 
+    /* ---------------- constants & helpers ---------------- */
+    const AGENT_ID = "agent-root";
+
+    const isHexAddr = (s) => typeof s === "string" && /^0x[a-fA-F0-9]{40}$/.test(s);
+    const shortAddr = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "");
+    const contractNodeId = (s) => `c-${encodeURIComponent(String(s))}`;
+    const contractLabel = (s) => (isHexAddr(s) ? shortAddr(s) : String(s || "Contract"));
+
+    /** Parse either envelope <<<TAG>>>{json}<<<END_TAG>>> or plain JSON */
+    function parseWsPayload(raw) {
+    if (typeof raw === "string") {
+        // Envelope
+        const m = raw.match(/^<<<([A-Z_]+)>>>([\s\S]*?)<<<END_\1>>>$/);
+        if (m) {
+        let inner = {};
+        try { inner = JSON.parse(m[2]); } catch {}
+        const tag = (inner?.tag_type || m[1]).toString().toLowerCase().replace(/_/g, "-");
+        return { type: tag, data: inner };
+        }
+        // Plain JSON
+        try { return JSON.parse(raw); } catch {}
+    }
+    return null;
+    }
+
+    function agentLabelFromData(data) {
+    let agent = data?.agent_type || data?.agent || data?.name || "";
+    if (!agent && typeof data?.content === "string") {
+        const cleaned = data.content.split("<<<END_")[0].trim();
+        try { agent = JSON.parse(cleaned)?.agent_type || ""; }
+        catch { agent = cleaned.match(/"agent_type"\s*:\s*"([^"]+)"/)?.[1] || ""; }
+    }
+    return `Agent: ${agent || "Unknown"}`;
+    }
+
+    /* ---------------- component ---------------- */
     export default function Diagram({ runId: runIdProp }) {
     const containerRef = useRef(null);
     const cyRef = useRef(null);
+    const centerRef = useRef({ x: 300, y: 200 }); // fallback center
+    const orderCounterRef = useRef(0); // for stable contract ordering
 
-    // Resolve runId: prop > localStorage > event
+    // Resolve runId: prop > localStorage > broadcast event
     const [runId, setRunId] = useState(runIdProp || null);
     useEffect(() => {
         if (runIdProp) { setRunId(runIdProp); return; }
@@ -32,10 +72,12 @@ function getSingletonWS(url) {
         return () => window.removeEventListener("mas:runId", onRunId);
     }, [runIdProp]);
 
+    // Backend base
     const API_BASE = useMemo(() => {
         return (process.env.NEXT_PUBLIC_API_BASE_URL || "https://shepherd-mas-dev.fly.dev").replace(/\/+$/, "");
     }, []);
 
+    // ws(s)://.../ws/{runId}
     const socketUrl = useMemo(() => {
         if (!runId) return null;
         const u = new URL(API_BASE);
@@ -47,9 +89,15 @@ function getSingletonWS(url) {
     // Init Cytoscape once
     useEffect(() => {
         if (!containerRef.current || cyRef.current) return;
+
+        // compute initial center
+        const rect = containerRef.current.getBoundingClientRect();
+        centerRef.current = { x: rect.width / 2, y: rect.height / 2 };
+
         cyRef.current = cytoscape({
         container: containerRef.current,
         style: [
+            /* Nodes */
             {
             selector: "node",
             style: {
@@ -60,7 +108,7 @@ function getSingletonWS(url) {
                 "text-halign": "center",
                 color: "#f8fafc",
                 "text-wrap": "wrap",
-                "text-max-width": 160,
+                "text-max-width": 180,
                 "font-size": 14,
                 "text-outline-width": 1,
                 "text-outline-color": "#0f172a",
@@ -71,75 +119,170 @@ function getSingletonWS(url) {
                 "border-color": "#38bdf8",
                 "transition-property": "opacity",
                 "transition-duration": "0.2s",
-                opacity: 1,
+                opacity: 1
+            }
             },
-            },
-            { selector: "node.agent", style: { "border-color": "#f43f5e" } },
+            { selector: "node.agent", style: { "border-color": "#f43f5e" } },      // agent = pink border
+            { selector: "node.contract", style: { "border-color": "#10b981" } },   // contract = green border
             { selector: "node.hidden", style: { opacity: 0 } },
+
+            /* Edges */
+            {
+            selector: "edge",
+            style: {
+                width: 2,
+                "line-color": "#64748b",
+                "target-arrow-color": "#64748b",
+                "target-arrow-shape": "triangle",
+                "curve-style": "bezier",
+                label: "data(label)",
+                "font-size": 11,
+                color: "#e5e7eb",
+                "text-rotation": "autorotate",
+                "text-background-color": "#0f172a",
+                "text-background-opacity": 0.85,
+                "text-background-padding": "2px",
+            }
+            }
         ],
         elements: [],
         layout: { name: "preset" },
+        wheelSensitivity: 0.2
         });
-        return () => { cyRef.current?.destroy(); cyRef.current = null; };
+
+        // on resize, recenter and reflow
+        const onResize = () => {
+        if (!containerRef.current) return;
+        const rect2 = containerRef.current.getBoundingClientRect();
+        centerRef.current = { x: rect2.width / 2, y: rect2.height / 2 };
+        recenterAgent();
+        reflowContracts();
+        };
+        window.addEventListener("resize", onResize);
+
+        return () => {
+        window.removeEventListener("resize", onResize);
+        cyRef.current?.destroy();
+        cyRef.current = null;
+        };
     }, []);
 
-    // Grid positioning
-    const nextPosition = () => {
+    /* --------- positioning utilities (center + radial rings) --------- */
+
+    const recenterAgent = () => {
         const cy = cyRef.current;
-        const count = cy?.nodes()?.length || 0;
-        const cols = 5;
-        return { x: 120 + (count % cols) * 180, y: 120 + Math.floor(count / cols) * 140 };
+        if (!cy) return;
+        const center = centerRef.current;
+        const agent = cy.$id(AGENT_ID);
+        if (agent.nonempty()) {
+        agent.position(center);
+        }
     };
 
-    // Labels
-    const labelFromMsg = (type, data) => {
-        const norm = String(type || "").toLowerCase().replace(/_/g, "-");
+    // Given N contracts, position them in rings around center.
+    // Ring capacities: 6, 12, 18, ... (6 * ringIndex)
+    // Radius grows per ring; clamp radius so everything stays in view.
+    const positionForIndex = (idx, center, containerRect) => {
+        const ringBaseCap = 6;
+        let ring = 1;
+        let prevSum = 0;
+        for (;;) {
+        const cap = ringBaseCap * ring;
+        if (idx < prevSum + cap) {
+            const posInRing = idx - prevSum;
+            const angleStep = (2 * Math.PI) / cap;
+            const angle = posInRing * angleStep - Math.PI / 2; // start at top
 
-        if (norm === "executor-tool-call") {
-        let tool = "";
-        if (typeof data?.content === "string") {
-            const cleaned = data.content.split("<<<END_")[0].trim();
-            try { tool = JSON.parse(cleaned)?.tool_name || ""; }
-            catch { tool = (cleaned.match(/"tool_name"\s*:\s*"([^"]+)"/)?.[1]) || ""; }
-        } else if (data && typeof data === "object") {
-            tool = data.tool_name || data.tool || data.name || "";
-        }
-        return `Tool: ${tool || "Unknown"}`;
-        }
+            // radius: start at 160, then +120 per ring
+            let radius = 160 + (ring - 1) * 120;
 
-        if (norm === "agent") {
-        let agent = "";
-        if (typeof data?.content === "string") {
-            const cleaned = data.content.split("<<<END_")[0].trim();
-            try { agent = JSON.parse(cleaned)?.agent_type || ""; }
-            catch { agent = (cleaned.match(/"agent_type"\s*:\s*"([^"]+)"/)?.[1]) || ""; }
-        } else if (data && typeof data === "object") {
-            agent = data.agent_type || data.agent || data.name || "";
-        }
-        return `Agent:`;
-        }
+            // clamp radius to fit container (with padding)
+            const pad = 40;
+            const maxR = Math.max(
+            60,
+            Math.min(center.x - pad, center.y - pad, containerRect.width - center.x - pad, containerRect.height - center.y - pad)
+            );
+            radius = Math.min(radius, maxR);
 
-        return String(type || "");
+            return {
+            x: center.x + radius * Math.cos(angle),
+            y: center.y + radius * Math.sin(angle),
+            };
+        }
+        prevSum += cap;
+        ring += 1;
+        }
     };
 
-    // --- parse helper: envelope or JSON ---
-    const parseWsPayload = (raw) => {
-        if (typeof raw === "string") {
-        // Envelope form: <<<TAG>>>{json}<<<END_TAG>>>
-        const m = raw.match(/^<<<([A-Z_]+)>>>([\s\S]*?)<<<END_\1>>>$/);
-        if (m) {
-            let inner = {};
-            try { inner = JSON.parse(m[2]); } catch { /* ignore */ }
-            const tag = (inner?.tag_type || m[1]).toLowerCase().replace(/_/g, "-");
-            return { type: tag, data: inner };
-        }
-        // Plain JSON form
-        try { return JSON.parse(raw); } catch {}
-        }
-        return null;
+    const reflowContracts = () => {
+        const cy = cyRef.current;
+        if (!cy || !containerRef.current) return;
+
+        const rect = containerRef.current.getBoundingClientRect();
+        const center = centerRef.current;
+
+        // stable ordering by data(order)
+        const nodes = cy.nodes(".contract").sort((a, b) => {
+        const ao = a.data("order") ?? 0;
+        const bo = b.data("order") ?? 0;
+        return ao - bo;
+        });
+
+        nodes.forEach((n, idx) => {
+        const pos = positionForIndex(idx, center, rect);
+        n.position(pos);
+        });
+
+        // keep agent centered
+        recenterAgent();
     };
 
-    // Connect WS and handle messages
+    /* ---------------- ensure/create nodes ---------------- */
+
+    const ensureAgentNode = (label) => {
+        const cy = cyRef.current;
+        if (!cy) return null;
+        const center = centerRef.current;
+
+        let node = cy.$id(AGENT_ID);
+        if (node.nonempty()) {
+        if (label) node.data("label", label);
+        node.position(center);
+        return node;
+        }
+        node = cy.add({
+        group: "nodes",
+        data: { id: AGENT_ID, label: label || "Agent" },
+        position: center,
+        classes: "hidden agent"
+        });
+        requestAnimationFrame(() => node.removeClass("hidden"));
+        return node;
+    };
+
+    const ensureContractNode = (contractStr) => {
+        const cy = cyRef.current;
+        if (!cy) return null;
+        const id = contractNodeId(contractStr);
+        let node = cy.$id(id);
+        if (node.nonempty()) return node;
+
+        const rect = containerRef.current?.getBoundingClientRect() || { width: 800, height: 600 };
+        const center = centerRef.current;
+        const idx = cy.nodes(".contract").length; // next index in ring placement
+        const pos = positionForIndex(idx, center, rect);
+
+        node = cy.add({
+        group: "nodes",
+        data: { id, label: contractLabel(contractStr), order: orderCounterRef.current++ },
+        position: pos,
+        classes: "hidden contract"
+        });
+        requestAnimationFrame(() => node.removeClass("hidden"));
+        return node;
+    };
+
+    /* ---------------- connect WS and process messages ---------------- */
     useEffect(() => {
         if (!cyRef.current || !socketUrl) return;
 
@@ -157,21 +300,66 @@ function getSingletonWS(url) {
         if (t !== "agent" && t !== "executor-tool-call") return;
 
         const cy = cyRef.current;
-        const id = `${t}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        const label = labelFromMsg(t, msg.data || {});
-        const classes = t === "agent" ? "hidden agent" : "hidden";
 
-        cy.add({
-            group: "nodes",
-            data: { id, label },
-            position: nextPosition(),
-            classes,
-        });
+        if (t === "agent") {
+            // Create/update the single agent node and keep centered
+            const label = agentLabelFromData(msg.data || {});
+            ensureAgentNode(label);
+            recenterAgent();
+            return;
+        }
 
-        requestAnimationFrame(() => cy.$id(id).removeClass("hidden"));
+        if (t === "executor-tool-call") {
+            // Ensure the agent exists
+            ensureAgentNode();
+
+            // Pull tool name
+            const toolName =
+            msg.data?.tool_name ||
+            msg.data?.name ||
+            (typeof msg.data?.content === "string"
+                ? (() => {
+                    const cleaned = msg.data.content.split("<<<END_")[0].trim();
+                    try { return JSON.parse(cleaned)?.tool_name || ""; }
+                    catch { return cleaned.match(/"tool_name"\s*:\s*"([^"]+)"/)?.[1] || ""; }
+                })()
+                : "") ||
+            "tool";
+
+            // Contracts: prefer `contracts`; fallback to tool args.addresses
+            let contracts = [];
+            if (Array.isArray(msg.data?.contracts)) contracts = msg.data.contracts;
+            else if (Array.isArray(msg.data?.args?.addresses)) contracts = msg.data.args.addresses;
+
+            // Create edges Agent -> each Contract, labeled with toolName
+            contracts.forEach((cStr) => {
+            const cNode = ensureContractNode(cStr);
+            if (!cNode) return;
+
+            const edgeId = `e-${AGENT_ID}-${cNode.id()}-${toolName}-${Date.now()}-${Math.random()
+                .toString(36)
+                .slice(2, 6)}`;
+            cy.add({
+                group: "edges",
+                data: {
+                id: edgeId,
+                source: AGENT_ID,
+                target: cNode.id(),
+                label: toolName
+                }
+            });
+            });
+
+            // After any additions, reflow all contracts radially
+            reflowContracts();
+            return;
+        }
         };
 
-        const onError = (e) => console.error("[Diagram] WS error:", e);
+        const onError = (e) => {
+        // eslint-disable-next-line no-console
+        console.error("[Diagram] WS error:", e);
+        };
 
         ws.addEventListener("message", onMessage);
         ws.addEventListener("error", onError);

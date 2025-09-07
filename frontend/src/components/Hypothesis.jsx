@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useMemo } from "react";
 import { FaEdit, FaWindowMinimize } from "react-icons/fa";
-import { useSearchParams } from "next/navigation";
+import { useSearchParams, useRouter } from "next/navigation";
 
 /* ---------- helpers ---------- */
 
@@ -39,6 +39,10 @@ const makeRunId = () =>
     const runIdRef = useRef(makeRunId());
     const runId = runIdRef.current;
 
+    // Define a router to redirect to different pages
+    const router = useRouter();
+    const inputRef = useRef(null);
+
     // Publish runId so Diagram (or others) can reuse it
     useEffect(() => {
         try { localStorage.setItem("masRunId", runId); } catch {}
@@ -67,7 +71,75 @@ const makeRunId = () =>
         if (text) setMessages(prev => [...prev, { from: "system", text }]);
     };
 
+    // Auto-focus input when waiting for user input
+    useEffect(() => {
+        if (waitingForInput && inputRef.current) {
+            setTimeout(() => inputRef.current?.focus( {preventScroll : true}), 100);
+        }
+    }, [waitingForInput]);
+   
+    // calls the cancel api and removes this run from the running state
+    const cancelRun = async () => {
+        try {
+            await fetch(`${API_BASE}/runs/${runId}/cancel`, {
+                method: "DELETE",
+                headers: { "Content-Type": "application/json" },
+            });
+            console.log("Run canceled")
+        } catch (error) {
+            console.error("Failed to cancel run:", error);
+        }
+    };
+
+    // prompts the user to save their email (call if an unexpected error occurs)
+    const saveWaitlistEmail = async (email) => {
+        if (email && email.trim()) {
+            try {
+                await fetch(`${API_BASE}/save-waitlist-email`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ email: email.trim() }),
+                });
+            } catch (error) {
+                console.error("Failed to save email:", error);
+                alert("Failed to save your email. Please try again later.");
+            }
+        }
+    };
+
+    // cancels run if the tab closes
+    useEffect(() => {
+        const handleBeforeUnload = () => {
+            if (startedRef.current && runId) {
+                console.log("Tab closing/reloading, canceling run:", runId);
+                
+                // Use navigator.sendBeacon for reliable delivery during page unload
+                navigator.sendBeacon(
+                    `${API_BASE}/runs/${runId}/cancel`, 
+                    new Blob([JSON.stringify({ runId })], { type: 'application/json' })
+                );
+                // Method 2: Backup fetch with keepalive
+                fetch(`${API_BASE}/runs/${runId}/cancel`, {
+                    method: "DELETE",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ runId }),
+                    keepalive: true // Keeps request alive during page unload
+                }).catch(() => {
+                    console.log("Backup fetch failed (expected during reload)");
+                });
+                }
+        };
+
+        // Add event listeners for page close/reload
+        window.addEventListener("beforeunload", handleBeforeUnload);
+
+        return () => {
+            window.removeEventListener("beforeunload", handleBeforeUnload);
+        };
+    }, [API_BASE, runId]);
+
     const processRaw = (raw) => {
+        console.log(raw);
         // 1) Handle tagged envelopes like <<<DESCRIPTION>>>{json}<<<END_DESCRIPTION>>>
         if (typeof raw === "string") {
         const m = raw.match(/^<<<([A-Z_]+)>>>([\s\S]*?)<<<END_\1>>>$/);
@@ -79,15 +151,16 @@ const makeRunId = () =>
 
             if (tagLower === "description") {
             applyMessage(inner?.message || inner?.text || "");
+            cancelRun();
             return;
             }
             if (tagLower === "prompt") {
             const t = inner?.prompt || inner?.message || "";
             if (t) applyMessage(t);
             setWaitingForInput(true);
+            setTimeout(() => inputRef.current?.focus({preventScroll : true}), 100); // auto focus on the text box
             return;
             }
-            // add more tag handlers as needed (e.g., OUTPUT, STDERR)
         }
         }
 
@@ -98,66 +171,181 @@ const makeRunId = () =>
 
         const t = String(msg.type).toLowerCase();
         if (t === "prompt") {
-        applyMessage(msg.data?.prompt || "");
-        setWaitingForInput(true);
-        return;
+            const promptText = msg.data?.prompt || "";
+            
+            // Check if this is asking for GitHub URL
+            if (promptText.includes("Please enter a GitHub URL")) {
+                
+                console.log("🔗 Auto-responding to GitHub URL prompt with:", repoUrl);
+                
+                
+                // Auto-respond with the stored repo URL
+                if (repoUrl && socketRef.current) {
+                    
+                    // Send the repo URL automatically
+                    socketRef.current.send(JSON.stringify({ type: "input", data: repoUrl }));
+                    
+                    console.log("Auto-sent repo URL:", repoUrl);
+                } else {
+                    console.error("No repo URL available or WebSocket not connected");
+                    applyMessage("Error: No repository URL available");
+                    // fallback: ask the user to enter the repo url
+                    applyMessage(msg.data?.prompt || "");
+                    setWaitingForInput(true);
+                    setTimeout(() => inputRef.current?.focus({preventScroll : true}), 100);
+                }
+                return;
+            }
+            applyMessage(msg.data?.prompt || "");
+            setWaitingForInput(true);
+            setTimeout(() => inputRef.current?.focus({preventScroll : true}), 100);
+            return;
         }
         if (t === "description") {
         // backend might send {data: {message}} or just a string
         applyMessage(msg.data?.message || msg.data || "");
         return;
         }
-        if (t === "output" || t === "stderr" || t === "stdout" || t === "log") {
+        // stream planner information
+        if(t === "planner-step"){
+        applyMessage(msg.data?.content || msg.data || "");
+        return;
+        }
+        // stream planner information
+        if(t === "executor-tool-call"){
+        applyMessage(`Calling tool ${msg.data?.tool_name || "Unknown Tool"}`);
+        return;
+        }
+        // stream tool result information
+        if (t === "executor-tool-result") {
+        const toolName = msg.data?.tool_name || "Tool";
+        const status = msg.data?.status || "unknown";
+        const output = msg.data?.tool_output || "";
+        const errorType = msg.data?.error_type;
+        const reason = msg.data?.reason;
+        
+        if (status === "error" || errorType) {
+            applyMessage(`${toolName}: ERROR - ${errorType || reason || "Unknown error"}`);
+        } else {
+            applyMessage(`${toolName}: ${status} - ${output}`);
+        }
+        return;
+        }
+        if (t === "agent") {
+        applyMessage(`${msg.data?.agent_type || "Unknown"} agent:\n${msg.data?.content || msg.data || ""}`);
+        return;
+        }
+        if (t === "output" || t === "stdout" || t === "log") {
         applyMessage(typeof msg.data === "string" ? msg.data.trim() : (msg.data?.message || ""));
+        return;
+        }
+        if (t === "idle_timeout") {
+        alert(String(msg.data?.message) || "This run has been canceled due to inactivity");
+        cancelRun();
+        router.push("/"); // Redirect to home page
+        return;
+        }
+        // if (t === "complete") {
+        // console.log("user entered N");
+        // cancelRun();
+        // return;
+        // }
+        if (t === "stderr") {
+        const errorMsg = typeof msg.data === "string" ? msg.data.trim() : (msg.data?.message || "An error occurred");
+        applyMessage(`Error: ${errorMsg}`);
+        cancelRun(); // Cancel the run
+        return;
+        }
+        if (t === "error") {
+        const errorMsg = typeof msg.data === "string" ? msg.data.trim() : (msg.data?.message || "An error occurred");
+        applyMessage(`Error: ${errorMsg}`);
+        cancelRun(); // Cancel the run
         return;
         }
     };
 
     // WebSocket setup — start the run on open, then just stream (no polling)
     useEffect(() => {
-        const socket = getSingletonWS(socketUrl);
-        socketRef.current = socket;
-
-        const onOpen = async () => {
         if (!startedRef.current) {
             startedRef.current = true;
-            try {
-            const body = repoUrl ? { github_url: repoUrl } : {};
-            await fetch(`${API_BASE}/runs/${runId}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-            } catch {
-            // ignore; if the run already exists, WS streaming should still work
-            }
+            console.log("Starting run for runId:", runId);
+            
+            const startRunThenSocket = async () => {
+                try {
+                    const body = repoUrl ? { github_url: repoUrl } : {};
+                    const response = await fetch(`${API_BASE}/runs/${runId}`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body),
+                    });
+                    
+                    const result = await response.json();
+
+                    console.log(result);
+
+                    if (result.status === "started")
+                    {
+                        // Run started successfully, now create WebSocket
+                        const socket = getSingletonWS(socketUrl);
+                        socketRef.current = socket;
+
+                        const onMessage = (event) => {
+                            // event.data can be string or Blob
+                            const raw = event.data;
+                            if (raw instanceof Blob) {
+                                raw.text().then(processRaw).catch(() => {});
+                            } else {
+                                processRaw(raw);
+                            }
+                        };
+                        
+                        const onError = async (e) => {
+                            console.error("WebSocket error:", e);
+                            const email = prompt("Connection failed! Something went wrong on our end. Enter your email to be notified when we've got a fix:");
+                            await saveWaitlistEmail(email);
+                            router.push("/new-test");
+                        };
+
+                        const onClose = async (e) => {
+                            console.log("WebSocket closed, code:", e.code);
+                            if (e.code !== 1000 && e.code !== 1001) {
+                                const email = prompt("Connection lost unexpectedly! Enter your email to be notified when we've resolved the issue:");
+                                await saveWaitlistEmail(email);
+                                router.push("/new-test");
+                            }
+                        };
+
+                        socket.addEventListener("message", onMessage);
+                        socket.addEventListener("error", onError);
+                        socket.addEventListener("close", onClose);
+                    } else if (result.status === "at_capacity" || result.status === "at capacity" || result.status === "queued" ) {
+                        const email = prompt("Our server is at capacity! Enter your email to be notified when it's available again:");
+    
+                        await saveWaitlistEmail(email);
+    
+                        router.push("/"); // Redirect to home page
+                        return;
+                    }
+                    else if (response.status !== 202) {
+                        console.log("Unexpected status code:", response.status);
+                        const email = prompt("Something went wrong! Enter your email to be notified when we've got a fix:");
+                        await saveWaitlistEmail(email);
+                        router.push("/new-test");
+                        return;
+                    }
+                    else{
+                        console.log("result status not parsed correctly")
+                    }
+                    
+                } catch (error) {
+                    // ignore; if the run already exists, WS streaming should still work
+                    console.error("Error in startRunThenSocket:", error);
+                    console.error("Error details:", error.message, error.stack);
+                }
+            };
+            
+            startRunThenSocket();
         }
-        };
-
-        const onMessage = (event) => {
-        // event.data can be string or Blob
-        const raw = event.data;
-        if (raw instanceof Blob) {
-            raw.text().then(processRaw).catch(() => {});
-        } else {
-            processRaw(raw);
-        }
-        };
-
-        const onError = (e) => {
-        // eslint-disable-next-line no-console
-        console.error("WebSocket error:", e);
-        };
-
-        socket.addEventListener("open", onOpen);
-        socket.addEventListener("message", onMessage);
-        socket.addEventListener("error", onError);
-
-        return () => {
-        socket.removeEventListener("open", onOpen);
-        socket.removeEventListener("message", onMessage);
-        socket.removeEventListener("error", onError);
-        };
     }, [socketUrl, API_BASE, repoUrl, runId]);
 
     // Auto-scroll to latest message
@@ -167,6 +355,27 @@ const makeRunId = () =>
 
     const handleSend = () => {
         if (!input.trim() || !waitingForInput) return;
+
+        // Check if the last message was asking about running another MAS
+        // Cancel the run if the user enters N
+        const lastMessage = messages[messages.length - 1];
+        const isRunAnotherPrompt = lastMessage && 
+            lastMessage.from === "system" && 
+            lastMessage.text.toLowerCase().includes("run another mas");
+        
+        if (isRunAnotherPrompt) {
+            const userResponse = input.trim().toLowerCase();
+            
+            if (userResponse !== "y" && userResponse !== "yes") {
+                // User said N/no or anything else - cancel run
+                console.log("User declined to run another MAS - canceling run");
+                setMessages(prev => [...prev, { from: "user", text: input }]);
+                cancelRun();
+                setWaitingForInput(false);
+                return;
+            }
+        }
+
         setMessages(prev => [...prev, { from: "user", text: input }]);
         socketRef.current?.send(JSON.stringify({ type: "input", data: input }));
         setInput("");
@@ -200,6 +409,7 @@ const makeRunId = () =>
 
             <div className="flex items-center gap-2 mt-4">
                 <input
+                ref={inputRef}
                 type="text"
                 placeholder="Type your answer..."
                 value={input}
