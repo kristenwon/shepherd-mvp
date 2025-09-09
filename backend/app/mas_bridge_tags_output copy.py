@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
-
+from .utils import save_hypothesis_to_firestore
 load_dotenv()
 
 # Configuration for MAS repository
@@ -54,6 +54,7 @@ class TagParser:
         'VALIDATOR': r'<<<VALIDATOR>>>(.*?)<<<END_VALIDATOR>>>',
         'SUMMARY': r'<<<SUMMARY>>>(.*?)<<<END_SUMMARY>>>',
         'DESCRIPTION': r'<<<DESCRIPTION>>>(.*?)<<<END_DESCRIPTION>>>',
+        'PLANNER_STEP': r'<<<PLANNER_STEP>>>(.*?)<<<END_PLANNER_STEP>>>',
     }
     
     def __init__(self):
@@ -193,7 +194,6 @@ class PromptDetector:
             r'\(\d+/\d+\)',  # (1/10) style progress
             r'\.{3,}',  # Multiple dots ...
             r'\s{2,}\d+\s{2,}',  # Spaced numbers
-            r'[│├└─═║╔╗╚╝]',  # Box drawing characters
             r'^\s*\*+\s*$',  # Lines of asterisks
             r'^\s*-+\s*$',  # Lines of dashes
             r'^\s*=+\s*$',  # Lines of equals
@@ -226,8 +226,6 @@ class PromptDetector:
             return False
         
         line_lower = line.lower().strip()
-        # if "run another mas?" in line_lower:
-        #     return True
         if "press enter twice" in line_lower:
             return False
         
@@ -249,7 +247,7 @@ class PromptDetector:
             r'Enter the specific function.*:$',
             r'Enter hypothesis.*:$',
             r'Enter your detailed vulnerability hypothesis.*:$',
-            r'▶️\s*Run another MAS\?.*:$', 
+            r'â–¶ï¸\s*Run another MAS\?.*:$', 
             r'Run another MAS\?.*:$',  
             r'\(y/N\):?\s*$',  
         ]
@@ -366,6 +364,9 @@ class TagAwareOutputBuffer:
         self.pending_prompt = None
         self.needs_input = False
         
+        # Track if we've recently handled a hypothesis prompt via USER_INPUT
+        self.handled_hypothesis_via_tag = False
+        
     async def add_char(self, char: str):
         """Character-by-character processing - only send when inside tags"""
         self.buffer += char
@@ -417,6 +418,10 @@ class TagAwareOutputBuffer:
                     if value is None and prompt_text:
                         # Clean up the prompt text
                         clean_prompt = prompt_text.strip()
+                        
+                        # Check if this is a hypothesis prompt
+                        if "hypothesis" in clean_prompt.lower():
+                            self.handled_hypothesis_via_tag = True
                         
                         # Check if we haven't already handled this prompt
                         prompt_key = f"{clean_prompt}_{self.current_stream_id}"
@@ -517,6 +522,7 @@ class TagAwareOutputBuffer:
         self.current_stream_id = None
         self.pending_prompt = None
         self.needs_input = False
+        self.handled_hypothesis_via_tag = False
     
     async def flush_if_not_prompt(self):
         """Modified: Only clear buffers"""
@@ -578,6 +584,7 @@ async def launch_mas_interactive(
     input_handler: Callable,
     ws_manager=None,
     log_dir: str = "./backend/logs",
+    input_queues: Dict[str, asyncio.Queue] = None,
 ) -> Dict[str, Any]:
     """
     Launch MAS subprocess with tag-based streaming and error handling
@@ -700,6 +707,15 @@ async def launch_mas_interactive(
                         
                         print(f"[SHEPHERD] Processing USER_INPUT prompt: {prompt_text}")
                         
+                        # Check if this is a hypothesis prompt and mark it
+                        is_hypothesis = "hypothesis" in prompt_text.lower()
+                        if is_hypothesis:
+                            output_buffer.handled_hypothesis_via_tag = True
+                            # Add to seen prompts to prevent legacy detection
+                            detector.seen_prompts.add("hypothesis_silent_wait")
+                            detector.seen_prompts.add("Enter your detailed vulnerability hypothesis:")
+                            detector.seen_prompts.add("Enter your detailed vulnerability hypothesis")
+                        
                         # Clear the pending prompt immediately
                         output_buffer.clear_prompt()
                         
@@ -707,17 +723,29 @@ async def launch_mas_interactive(
                         user_input = await input_handler(prompt_text)
                         
                         if user_input is not None:
+                            if is_hypothesis:
+                                try:
+                                    from .utils import save_hypothesis_to_firestore
+                                    save_hypothesis_to_firestore(run_id, user_input)
+                                    print(f"[SHEPHERD] Saved hypothesis to Firebase for run {run_id}")
+                                except Exception as e:
+                                    print(f"[SHEPHERD] Failed to save hypothesis to Firebase: {e}")
                             try:
                                 if process.returncode is None:
                                     # Send the input to the process
                                     process.stdin.write((user_input + '\n').encode())
                                     await process.stdin.drain()
                                     
+                                    # For hypothesis, send extra newline
+                                    if "hypothesis" in prompt_text.lower():
+                                        process.stdin.write('\n'.encode())
+                                        await process.stdin.drain()
+                                    
                                     print(f"[SHEPHERD] Sent user input: {user_input}")
                                     
                                     # Special handling for "Run another MAS?"
                                     if "Run another MAS?" in prompt_text:
-                                        if user_input.lower() in ['y', 'yes']:
+                                        if user_input.lower() in ['y']:
                                             output_buffer.reset_for_new_mas()
                                             detector.seen_prompts.clear()
                                             print("[SHEPHERD] User chose to run another MAS, state reset")
@@ -733,24 +761,28 @@ async def launch_mas_interactive(
                         
                         no_output_count = 0
                         continue
+                    
                     # Flush non-prompt buffers on timeout
                     await output_buffer.flush_if_not_prompt()
                     
                     current_buffer = buffer.strip()
                     recent_output = "".join(all_output[-100:]) if all_output else ""
-                    # Check for hypothesis prompt (silent wait)
-         
+                    
+                    # Check for hypothesis prompt (silent wait) - SKIP if already handled via tag or seen
                     hypothesis_instruction_seen = False
                     for line in detector.recent_lines[-5:]:
                         if "Enter hypothesis (press Enter twice when done):" in line:
                             hypothesis_instruction_seen = True
                             break
                     
-                    current_time = asyncio.get_event_loop().time()
-                    time_since_last = current_time - last_char_time
-                    
+                    # Only process if we haven't already handled this via USER_INPUT tag
                     if hypothesis_instruction_seen and time_since_last > 0.5 and not detector.waiting_for_multiline:
                         if "hypothesis_silent_wait" in detector.seen_prompts:
+                            continue
+                        
+                        # Double-check we haven't just handled a hypothesis via tag
+                        if output_buffer.handled_hypothesis_via_tag:
+                            output_buffer.handled_hypothesis_via_tag = False  # Reset for next time
                             continue
                         
                         detector.waiting_for_multiline = True
@@ -847,32 +879,17 @@ async def launch_mas_interactive(
                 # Decode character
                 char = data.decode('utf-8', errors='ignore')
                 
-                # Check for error state
-                if "GRAPH_RECURSION_LIMIT" in "".join(all_output[-500:]):
-                    if not error_state:
-                        print(f"[DEBUG] ENTERING ERROR STATE - detected GRAPH_RECURSION_LIMIT")
-                    error_state = True
-                    output_buffer.error_state = True
                 
                 # Always accumulate buffer
                 buffer += char
                 line_buffer += char
                 
-                
-                # Process character through output buffer
-                if error_state:
-                    # In error state, send directly
-                    log_file.write(char)
-                    log_file.flush()
-                    print(char, end='', flush=True)
-                    all_output.append(char)
-                else:
-                    # Normal flow - use output buffer with tag processing
-                    await output_buffer.add_char(char)
-                    log_file.write(char)
-                    log_file.flush()
-                    print(char, end='', flush=True)
-                    all_output.append(char)
+                # Normal flow - use output buffer with tag processing
+                await output_buffer.add_char(char)
+                log_file.write(char)
+                log_file.flush()
+                print(char, end='', flush=True)
+                all_output.append(char)
                 
                 # Handle newlines for buffer management
                 if char == '\n':
@@ -904,7 +921,6 @@ async def launch_mas_interactive(
                     "success": return_code == 0
                 }
             })
-        
         return {
             "success": return_code == 0,
             "exit_code": return_code,
@@ -927,8 +943,7 @@ async def launch_mas_interactive(
                     "error": str(e),
                     "traceback": traceback.format_exc()
                 }
-            })
-        
+            })         
         return {
             "success": False,
             "error": str(e),
