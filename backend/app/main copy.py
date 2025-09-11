@@ -15,7 +15,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 from .ws_manager import WebSocketManager
-from .mas_bridge_tags_output import launch_mas_interactive, create_ws_input_handler
+from .dvd3_mas_bridge_tags_output import launch_mas_interactive, create_ws_input_handler
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
 
 @asynccontextmanager

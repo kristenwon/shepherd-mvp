@@ -16,7 +16,8 @@ from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from .utils import save_email_to_firestore
 from .ws_manager import WebSocketManager
-from .mas_bridge_tags_output import launch_mas_interactive, create_ws_input_handler
+from . import dvd3_mas_bridge_tags_output as dvd3_bridge
+from . import dvd2_mas_bridge_tags_output as dvd2_bridge
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
 from .models.waitlist import WaitlistRequest
 from dotenv import load_dotenv
@@ -485,8 +486,8 @@ async def delete_repository_analysis_endpoint(run_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete repository analysis: {str(e)}")
 
 # Run Management Endpoint (WITHOUT QUEUE - JUST CAPACITY CHECK)
-@app.post("/runs/{run_id}")
-async def start_run(run_id: str, job: JobRequest, tasks: BackgroundTasks):
+@app.post("/runs/{challenge_name}/{run_id}")
+async def start_run(challenge_name: str,run_id: str, job: JobRequest, tasks: BackgroundTasks):
     """Kick off MAS in the background with WebSocket-based interaction - no queuing."""
     
     # Add run to manager (will either start or return at_capacity)
@@ -496,20 +497,36 @@ async def start_run(run_id: str, job: JobRequest, tasks: BackgroundTasks):
         # Create input queue for this run
         input_queues[run_id] = asyncio.Queue()
         
-        # Create the WebSocket-based input handler
-        input_handler = create_ws_input_handler(run_id, input_queues[run_id])
+        if challenge_name == "dvd2":    
+            print(f"🚀 Starting DVD2 MAS for run {run_id}")
+            # Create the WebSocket-based input handler
+            input_handler = dvd2_bridge.create_ws_input_handler(run_id, input_queues[run_id])
+        elif challenge_name == "dvd3":
+            print(f"🚀 Starting DVD3 MAS for run {run_id}")
+            # Create the WebSocket-based input handler
+            input_handler = dvd3_bridge.create_ws_input_handler(run_id, input_queues[run_id])
         
         # Wrapper to handle completion
         async def run_with_completion():
             try:
-                result = await launch_mas_interactive(
-                    run_id=run_id,
-                    job=job.dict(),
-                    input_handler=input_handler,
-                    ws_manager=ws_manager,
-                    log_dir="./backend/logs",
-                    input_queues=input_queues
-                )
+                if challenge_name == "dvd2":
+                    result = await dvd2_bridge.launch_mas_interactive(
+                        run_id=run_id,
+                        job=job.dict(),
+                        input_handler=input_handler,
+                        ws_manager=ws_manager,
+                        log_dir="./backend/logs",
+                        input_queues=input_queues
+                    )
+                elif challenge_name == "dvd3":
+                    result = await dvd3_bridge.launch_mas_interactive(
+                        run_id=run_id,
+                        job=job.dict(),
+                        input_handler=input_handler,
+                        ws_manager=ws_manager,
+                        log_dir="./backend/logs",
+                        input_queues=input_queues
+                    )
                 if 'pid' in result:
                     run_manager.register_process(run_id, result['pid'])
                 success = result.get("success", False)
@@ -631,7 +648,9 @@ async def health_check():
 @app.get("/settings")
 async def settings():
     return {"MAX_CONCURRENT_RUNS": os.getenv("MAX_CONCURRENT_RUNS"), 
-            "IDLE_TIMEOUT_SECONDS": os.getenv("IDLE_TIMEOUT_SECONDS")}
+            "IDLE_TIMEOUT_SECONDS": os.getenv("IDLE_TIMEOUT_SECONDS"),
+            "NEXT_PUBLIC_API_BASE_URL": os.getenv("NEXT_PUBLIC_API_BASE_URL")
+            }
 
 @app.post("/save-waitlist-email")
 async def save_waitlist_email(payload: WaitlistRequest):
