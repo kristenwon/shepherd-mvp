@@ -28,7 +28,7 @@ export default function Home() {
         <div className="w-full flex flex-row justify-between items-center">
           <div className="flex flex-col">
             <p className="text-md font-semibold">My Repositories</p>
-            <p className="text-[#595959]">Access all your previous repositories and hypotheses.</p>
+            <p className="text-[#8f8f8f]">Access all your previous repositories and hypotheses.</p>
           </div>
           <Link href="/new-test">
             <button className="bg-[#df153e] px-4 py-2 rounded-lg hover:scale-105">+</button>
@@ -43,7 +43,7 @@ export default function Home() {
         <div className="w-full flex flex-row justify-between items-center">
           <div className="flex flex-col">
             <p className="text-md font-semibold">References</p>
-            <p className="text-[#595959]">Identify smart contracts with similar vulnerabilities to support your hypothesis.</p>
+            <p className="text-[#8f8f8f]">Identify smart contracts with similar vulnerabilities to support your hypothesis.</p>
           </div>
           <button className="bg-[#df153e] px-4 py-2 rounded-lg hover:scale-105">+</button>
         </div>

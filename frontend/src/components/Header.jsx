@@ -24,7 +24,7 @@ export default function Header() {
                 />
                 <div className="flex flex-col">
                     <p className="text-sm">PT</p>
-                    <p className="text-[#595959] text-sm">@0xps</p>
+                    <p className="text-[#8f8f8f] text-sm">@0xps</p>
                 </div>
             </div>
         </div>

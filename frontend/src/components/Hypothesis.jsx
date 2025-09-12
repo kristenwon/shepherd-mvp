@@ -30,6 +30,7 @@ const makeRunId = () =>
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState("");
     const [waitingForInput, setWaitingForInput] = useState(false);
+    const [runStatus, setRunStatus] = useState("Initializing...");
 
     const messagesEndRef = useRef(null);
     const socketRef = useRef(null);
@@ -273,12 +274,20 @@ const makeRunId = () =>
             const startRunThenSocket = async () => {
                 try {
                     const body = repoUrl ? { github_url: repoUrl } : {};
-                    const response = await fetch(`${API_BASE}/runs/${runId}`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(body),
-                    });
-                    
+                    let fetch_url = ``;
+                    if(repoUrl.toLowerCase().includes("naive-receiver")){
+                        fetch_url = `${API_BASE}/runs/dvd2/${runId}`;
+                    }
+                    else if(repoUrl.toLowerCase().includes("truster")){
+                        fetch_url = `${API_BASE}/runs/dvd3/${runId}`;
+                    } else {
+                        throw new Error(`Unsupported repoUrl: ${repoUrl}`);
+                    }
+                    const response = await fetch(fetch_url, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(body),
+                        });
                     const result = await response.json();
 
                     console.log(result);
@@ -318,7 +327,11 @@ const makeRunId = () =>
                         socket.addEventListener("message", onMessage);
                         socket.addEventListener("error", onError);
                         socket.addEventListener("close", onClose);
+                        setRunStatus("Started"); // Change from Initializing... status
+
                     } else if (result.status === "at_capacity" || result.status === "at capacity" || result.status === "queued" ) {
+                        setRunStatus("At capacity");
+
                         const email = prompt("Our server is at capacity! Enter your email to be notified when it's available again:");
     
                         await saveWaitlistEmail(email);
@@ -327,6 +340,8 @@ const makeRunId = () =>
                         return;
                     }
                     else if (response.status !== 202) {
+                        setRunStatus("Error");
+
                         console.log("Unexpected status code:", response.status);
                         const email = prompt("Something went wrong! Enter your email to be notified when we've got a fix:");
                         await saveWaitlistEmail(email);
@@ -334,6 +349,7 @@ const makeRunId = () =>
                         return;
                     }
                     else{
+                        setRunStatus("Error");
                         console.log("result status not parsed correctly")
                     }
                     
@@ -354,11 +370,17 @@ const makeRunId = () =>
     }, [messages]);
 
     const handleSend = () => {
-        if (!input.trim() || !waitingForInput) return;
+        if (!waitingForInput) return;
+        const lastMessage = messages[messages.length - 1];
+
+        // If the prompt is asking for non-deployable files, then an empty response is valid; else, return
+        const isAskingForInterfaces = lastMessage && 
+            lastMessage.from === "system" && 
+            lastMessage.text.toLowerCase().includes("file names that are not deployable like interfaces");
+        if( !input.trim() && !isAskingForInterfaces) return;
 
         // Check if the last message was asking about running another MAS
         // Cancel the run if the user enters N
-        const lastMessage = messages[messages.length - 1];
         const isRunAnotherPrompt = lastMessage && 
             lastMessage.from === "system" && 
             lastMessage.text.toLowerCase().includes("run another mas");
@@ -370,6 +392,8 @@ const makeRunId = () =>
                 // User said N/no or anything else - cancel run
                 console.log("User declined to run another MAS - canceling run");
                 setMessages(prev => [...prev, { from: "user", text: input }]);
+                setInput("");
+                applyMessage("Session has ended successfully.");
                 cancelRun();
                 setWaitingForInput(false);
                 return;
@@ -388,6 +412,7 @@ const makeRunId = () =>
             <div className="flex items-center space-x-2">
             <p className="font-semibold">{title}</p>
             <FaEdit className="text-sm text-gray-400" />
+            <span className="text-[#8f8f8f]">{runStatus}</span>
             </div>
             <button onClick={() => onMinimize?.(id)}>
             <FaWindowMinimize className="text-gray-400" />
@@ -400,7 +425,7 @@ const makeRunId = () =>
                 {messages.map((msg, index) => (
                 <div key={index} className={`flex ${msg.from === "user" ? "justify-end" : "justify-start"}`}>
                     <div className={`px-4 py-2 rounded-lg text-sm max-w-xs break-words ${msg.from === "user" ? "bg-[#df153e] text-white" : "bg-[#141414] text-gray-300"}`}>
-                    {msg.text}
+                                {msg.text}
                     </div>
                 </div>
                 ))}
