@@ -56,7 +56,7 @@ const makeRunId = () =>
 
     // Backend base (env or fallback)
     const API_BASE = useMemo(() => {
-        return (process.env.NEXT_PUBLIC_API_BASE_URL || "https://shepherd-mas-dev.fly.dev/").replace(/\/+$/, "");
+        return (process.env.NEXT_PUBLIC_API_BASE_URL || "https://shepherd-mas.fly.dev/").replace(/\/+$/, "");
     }, []);
 
     // ws(s)://.../ws/{runId}
