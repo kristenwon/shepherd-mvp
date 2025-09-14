@@ -649,7 +649,8 @@ async def health_check():
 async def settings():
     return {"MAX_CONCURRENT_RUNS": os.getenv("MAX_CONCURRENT_RUNS"), 
             "IDLE_TIMEOUT_SECONDS": os.getenv("IDLE_TIMEOUT_SECONDS"),
-            "NEXT_PUBLIC_API_BASE_URL": os.getenv("NEXT_PUBLIC_API_BASE_URL")
+            "NEXT_PUBLIC_API_BASE_URL": os.getenv("NEXT_PUBLIC_API_BASE_URL"),
+            "HYPOTHESIS_COLLECTION": os.getenv("HYPOTHESIS_COLLECTION"),
             }
 
 @app.post("/save-waitlist-email")
