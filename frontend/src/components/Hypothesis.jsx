@@ -31,6 +31,8 @@ const makeRunId = () =>
     const [input, setInput] = useState("");
     const [waitingForInput, setWaitingForInput] = useState(false);
     const [runStatus, setRunStatus] = useState("Initializing...");
+    const [isSystemThinking, setIsSystemThinking] = useState(true);
+
 
     const messagesEndRef = useRef(null);
     const socketRef = useRef(null);
@@ -69,7 +71,9 @@ const makeRunId = () =>
 
     // ---- message processor (handles tagged envelopes and JSON) ----
     const applyMessage = (text) => {
+        setIsSystemThinking(false);
         if (text) setMessages(prev => [...prev, { from: "system", text }]);
+        setRunStatus("Started"); // Change from Initializing... status once the first message is sent
     };
 
     // Auto-focus input when waiting for user input
@@ -86,7 +90,7 @@ const makeRunId = () =>
                 method: "DELETE",
                 headers: { "Content-Type": "application/json" },
             });
-            console.log("Run canceled")
+            // console.log("Run canceled")
         } catch (error) {
             console.error("Failed to cancel run:", error);
         }
@@ -112,7 +116,7 @@ const makeRunId = () =>
     useEffect(() => {
         const handleBeforeUnload = () => {
             if (startedRef.current && runId) {
-                console.log("Tab closing/reloading, canceling run:", runId);
+                // console.log("Tab closing/reloading, canceling run:", runId);
                 
                 // Use navigator.sendBeacon for reliable delivery during page unload
                 navigator.sendBeacon(
@@ -140,7 +144,7 @@ const makeRunId = () =>
     }, [API_BASE, runId]);
 
     const processRaw = (raw) => {
-        console.log(raw);
+        // console.log(raw);
         // 1) Handle tagged envelopes like <<<DESCRIPTION>>>{json}<<<END_DESCRIPTION>>>
         if (typeof raw === "string") {
         const m = raw.match(/^<<<([A-Z_]+)>>>([\s\S]*?)<<<END_\1>>>$/);
@@ -177,7 +181,7 @@ const makeRunId = () =>
             // Check if this is asking for GitHub URL
             if (promptText.includes("Please enter a GitHub URL")) {
                 
-                console.log("🔗 Auto-responding to GitHub URL prompt with:", repoUrl);
+                // console.log("🔗 Auto-responding to GitHub URL prompt with:", repoUrl);
                 
                 
                 // Auto-respond with the stored repo URL
@@ -186,7 +190,7 @@ const makeRunId = () =>
                     // Send the repo URL automatically
                     socketRef.current.send(JSON.stringify({ type: "input", data: repoUrl }));
                     
-                    console.log("Auto-sent repo URL:", repoUrl);
+                    // console.log("Auto-sent repo URL:", repoUrl);
                 } else {
                     console.error("No repo URL available or WebSocket not connected");
                     applyMessage("Error: No repository URL available");
@@ -269,7 +273,7 @@ const makeRunId = () =>
     useEffect(() => {
         if (!startedRef.current) {
             startedRef.current = true;
-            console.log("Starting run for runId:", runId);
+            // console.log("Starting run for runId:", runId);
             
             const startRunThenSocket = async () => {
                 try {
@@ -280,6 +284,9 @@ const makeRunId = () =>
                     }
                     else if(repoUrl.toLowerCase().includes("truster")){
                         fetch_url = `${API_BASE}/runs/dvd3/${runId}`;
+                    }
+                    else if(repoUrl.toLowerCase().includes("unstoppable")){
+                        fetch_url = `${API_BASE}/runs/dvd1/${runId}`;
                     } else {
                         throw new Error(`Unsupported repoUrl: ${repoUrl}`);
                     }
@@ -290,7 +297,7 @@ const makeRunId = () =>
                         });
                     const result = await response.json();
 
-                    console.log(result);
+                    // console.log(result);
 
                     if (result.status === "started")
                     {
@@ -316,7 +323,7 @@ const makeRunId = () =>
                         };
 
                         const onClose = async (e) => {
-                            console.log("WebSocket closed, code:", e.code);
+                            // console.log("WebSocket closed, code:", e.code);
                             if (e.code !== 1000 && e.code !== 1001) {
                                 const email = prompt("Connection lost unexpectedly! Enter your email to be notified when we've resolved the issue:");
                                 await saveWaitlistEmail(email);
@@ -327,7 +334,6 @@ const makeRunId = () =>
                         socket.addEventListener("message", onMessage);
                         socket.addEventListener("error", onError);
                         socket.addEventListener("close", onClose);
-                        setRunStatus("Started"); // Change from Initializing... status
 
                     } else if (result.status === "at_capacity" || result.status === "at capacity" || result.status === "queued" ) {
                         setRunStatus("At capacity");
@@ -390,7 +396,7 @@ const makeRunId = () =>
             
             if (userResponse !== "y" && userResponse !== "yes") {
                 // User said N/no or anything else - cancel run
-                console.log("User declined to run another MAS - canceling run");
+                // console.log("User declined to run another MAS - canceling run");
                 setMessages(prev => [...prev, { from: "user", text: input }]);
                 setInput("");
                 applyMessage("Session has ended successfully.");
@@ -404,6 +410,7 @@ const makeRunId = () =>
         socketRef.current?.send(JSON.stringify({ type: "input", data: input }));
         setInput("");
         setWaitingForInput(false);
+        setIsSystemThinking(true);
     };
 
     return (
@@ -429,6 +436,19 @@ const makeRunId = () =>
                     </div>
                 </div>
                 ))}
+                {isSystemThinking && !waitingForInput && (
+                    <div className="flex justify-start">
+                        <div className="px-4 py-2 rounded-lg text-sm bg-[#141414] text-gray-300">
+                            <div className="flex space-x-1 items-center">
+                                <div className="flex space-x-1 ml-2">
+                                    <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce"></div>
+                                    <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></div>
+                                    <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
                 <div ref={messagesEndRef} />
             </div>
 

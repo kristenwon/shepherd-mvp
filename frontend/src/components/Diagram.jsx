@@ -135,7 +135,7 @@ function getSingletonWS(url) {
                 "target-arrow-color": "#64748b",
                 "target-arrow-shape": "triangle",
                 "curve-style": "bezier",
-                label: "data(label)",
+                label: "",
                 "font-size": 11,
                 color: "#e5e7eb",
                 "text-rotation": "autorotate",
@@ -148,6 +148,17 @@ function getSingletonWS(url) {
         elements: [],
         layout: { name: "preset" },
         wheelSensitivity: 0.2
+        });
+
+        // Add hover event listeners for edges
+        cyRef.current.on('mouseover', 'edge', function(evt) {
+        const edge = evt.target;
+        edge.style('label', edge.data('label'));
+        });
+
+        cyRef.current.on('mouseout', 'edge', function(evt) {
+        const edge = evt.target;
+        edge.style('label', '');
         });
 
         // on resize, recenter and reflow
