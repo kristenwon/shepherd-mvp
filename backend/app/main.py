@@ -16,8 +16,10 @@ from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from .utils import save_email_to_firestore
 from .ws_manager import WebSocketManager
-from . import dvd3_mas_bridge_tags_output as dvd3_bridge
+from . import dvd1_mas_bridge_tags_output as dvd1_bridge
 from . import dvd2_mas_bridge_tags_output as dvd2_bridge
+from . import dvd3_mas_bridge_tags_output as dvd3_bridge
+from . import dvd8_mas_bridge_tags_output as dvd8_bridge
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
 from .models.waitlist import WaitlistRequest
 from dotenv import load_dotenv
@@ -496,8 +498,11 @@ async def start_run(challenge_name: str,run_id: str, job: JobRequest, tasks: Bac
     if result["status"] == "started":
         # Create input queue for this run
         input_queues[run_id] = asyncio.Queue()
-        
-        if challenge_name == "dvd2":    
+        if challenge_name == "dvd1":    
+            print(f"🚀 Starting DVD1 MAS for run {run_id}")
+            # Create the WebSocket-based input handler
+            input_handler = dvd1_bridge.create_ws_input_handler(run_id, input_queues[run_id])
+        elif challenge_name == "dvd2":    
             print(f"🚀 Starting DVD2 MAS for run {run_id}")
             # Create the WebSocket-based input handler
             input_handler = dvd2_bridge.create_ws_input_handler(run_id, input_queues[run_id])
@@ -505,10 +510,23 @@ async def start_run(challenge_name: str,run_id: str, job: JobRequest, tasks: Bac
             print(f"🚀 Starting DVD3 MAS for run {run_id}")
             # Create the WebSocket-based input handler
             input_handler = dvd3_bridge.create_ws_input_handler(run_id, input_queues[run_id])
+        elif challenge_name == "dvd8":
+            print(f"🚀 Starting DVD8 MAS for run {run_id}")
+            # Create the WebSocket-based input handler
+            input_handler = dvd8_bridge.create_ws_input_handler(run_id, input_queues[run_id])
         
         # Wrapper to handle completion
         async def run_with_completion():
             try:
+                if challenge_name == "dvd1":
+                    result = await dvd1_bridge.launch_mas_interactive(
+                        run_id=run_id,
+                        job=job.dict(),
+                        input_handler=input_handler,
+                        ws_manager=ws_manager,
+                        log_dir="./backend/logs",
+                        input_queues=input_queues
+                    )
                 if challenge_name == "dvd2":
                     result = await dvd2_bridge.launch_mas_interactive(
                         run_id=run_id,
@@ -527,6 +545,16 @@ async def start_run(challenge_name: str,run_id: str, job: JobRequest, tasks: Bac
                         log_dir="./backend/logs",
                         input_queues=input_queues
                     )
+                elif challenge_name == "dvd8":
+                    result = await dvd8_bridge.launch_mas_interactive(
+                        run_id=run_id,
+                        job=job.dict(),
+                        input_handler=input_handler,
+                        ws_manager=ws_manager,
+                        log_dir="./backend/logs",
+                        input_queues=input_queues
+                    )
+                    
                 if 'pid' in result:
                     run_manager.register_process(run_id, result['pid'])
                 success = result.get("success", False)
