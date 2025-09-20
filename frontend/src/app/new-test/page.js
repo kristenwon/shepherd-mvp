@@ -45,6 +45,9 @@ export default function NewTest() {
                     <option value="https://github.com/dhruvjain2905/Unstoppable">
                         https://github.com/dhruvjain2905/Unstoppable
                     </option>
+                    <option value="https://github.com/tunonraksa/puppet-deploy">
+                        https://github.com/tunonraksa/puppet-deploy
+                    </option>
                 </select>
 
             </div>
