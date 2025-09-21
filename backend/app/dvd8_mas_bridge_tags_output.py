@@ -563,6 +563,27 @@ class TagAwareOutputBuffer:
             if content.startswith('{') and content.endswith('}'):
                 # Now parse the already-cleaned JSON
                 data = json.loads(content)
+                
+                # Special handling for reporter agent with markdown content
+                if tag_type == "AGENT":
+                    agent_type = data.get("agent_type", "")
+                    agent_content = data.get("content", "")
+                    
+                    if agent_type == "reporter" and "markdown" in agent_content.lower():
+                        # Find the first pipe character which indicates table start
+                        pipe_index = agent_content.find("|")
+                        
+                        if pipe_index != -1:
+                            # Extract from the first pipe to the end
+                            markdown_table = agent_content[pipe_index:].strip()
+                            
+                            # Also remove any trailing markdown code block markers if present
+                            if markdown_table.endswith("```"):
+                                markdown_table = markdown_table[:-3].strip()
+                            
+                            # Update the data with just the markdown table
+                            data["content"] = markdown_table
+                            data["is_markdown_table"] = True  # Add a flag for frontend
             else:
                 data = {"content": content}
             
@@ -725,6 +746,7 @@ async def launch_mas_interactive(
                         if user_input is not None:
                             if is_hypothesis:
                                 try:
+                                    from .utils import save_hypothesis_to_firestore
                                     save_hypothesis_to_firestore(run_id, user_input)
                                     print(f"[SHEPHERD] Saved hypothesis to Firebase for run {run_id}")
                                 except Exception as e:
@@ -911,7 +933,6 @@ async def launch_mas_interactive(
         
         print(f"\n[SHEPHERD] Process exited with code: {return_code}")
         
-            
         # Send completion notification
         if ws_manager:
             await ws_manager.send_log(run_id, {

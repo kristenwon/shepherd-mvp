@@ -689,5 +689,14 @@ async def save_waitlist_email(payload: WaitlistRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save email: {str(e)}")
     
+@app.get("/ping")
+def ping():
+    return {
+        "status": "pong",
+        "message": "Hello from localhost FastAPI!",
+        "timestamp": datetime.now().isoformat()
+    }
+    
+       
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=3000)
