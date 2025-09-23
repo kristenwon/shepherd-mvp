@@ -2,7 +2,7 @@
 import asyncio
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse,HTMLResponse
 from pydantic import BaseModel
 from typing import Dict, Optional, List
 import json
@@ -20,9 +20,16 @@ from . import dvd1_mas_bridge_tags_output as dvd1_bridge
 from . import dvd2_mas_bridge_tags_output as dvd2_bridge
 from . import dvd3_mas_bridge_tags_output as dvd3_bridge
 from . import dvd8_mas_bridge_tags_output as dvd8_bridge
+from . import byor_mas_bridge_tags_output as byor_bridge
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
 from .models.waitlist import WaitlistRequest
 from dotenv import load_dotenv
+import json
+from datetime import datetime
+import os
+from typing import Optional
+import zipfile
+import io
 
 load_dotenv()
 
@@ -587,6 +594,66 @@ async def start_run(challenge_name: str,run_id: str, job: JobRequest, tasks: Bac
     else:
         raise HTTPException(status_code=500, detail="Unexpected status from run manager")
 
+
+@app.post("/runs/{run_id}")
+async def start_run(run_id: str, job: JobRequest, tasks: BackgroundTasks):
+    
+    # Add run to manager (will either start or return at_capacity)
+    result = await run_manager.add_run(run_id, job.dict())
+    
+    if result["status"] == "started":
+        # Create input queue for this run
+        input_queues[run_id] = asyncio.Queue()
+    
+        print(f"🚀 Starting BYOR MAS for run {run_id}")
+        # Create the WebSocket-based input handler
+        input_handler = byor_bridge.create_ws_input_handler(run_id, input_queues[run_id])
+
+        
+        # Wrapper to handle completion
+        async def run_with_completion():
+            try:
+                result = await byor_bridge.launch_mas_interactive(
+                    run_id=run_id,
+                    job=job.dict(),
+                    input_handler=input_handler,
+                    ws_manager=ws_manager,
+                    log_dir="./backend/logs",
+                    input_queues=input_queues
+                )
+            
+                if 'pid' in result:
+                    run_manager.register_process(run_id, result['pid'])
+                success = result.get("success", False)
+            except Exception as e:
+                print(f"Error in run {run_id}: {e}")
+                success = False
+            finally:
+                run_manager.unregister_process(run_id)
+                # Mark as complete
+                await run_manager.complete_run(run_id, success)
+                
+                # Clean up input queue
+                if run_id in input_queues:
+                    del input_queues[run_id]
+        
+        # Start MAS in background
+        tasks.add_task(run_with_completion)
+        
+        return JSONResponse({
+            "status": "started",
+            "run_id": run_id
+        }, status_code=202)
+    
+    elif result["status"] == "at_capacity":
+        return JSONResponse({
+            "status": "at_capacity",
+            "message": result["message"]
+        }, status_code=503)  # 503 Service Unavailable
+    
+    else:
+        raise HTTPException(status_code=500, detail="Unexpected status from run manager")
+
 # Update the WebSocket endpoint to track activity
 @app.websocket("/ws/{run_id}")
 async def run_logs_ws(ws: WebSocket, run_id: str):
@@ -697,6 +764,150 @@ def ping():
         "timestamp": datetime.now().isoformat()
     }
     
+    
+@app.get("/test-upload-zip-file")
+async def get():
+    """Serve a simple HTML page for testing"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WebSocket File Upload Test</title>
+    </head>
+    <body>
+        <h1>WebSocket File Upload Test</h1>
+        <input type="file" id="fileInput" accept=".zip">
+        <button onclick="sendFile()">Send ZIP</button>
+        <div id="status"></div>
+        
+        <script>
+            const ws = new WebSocket("ws://localhost:3000/ws/test-upload/test");
+            
+            ws.onmessage = (event) => {
+                document.getElementById('status').innerHTML = event.data;
+            };
+            
+            function sendFile() {
+                const file = document.getElementById('fileInput').files[0];
+                if (file) {
+                    ws.send(file);
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.websocket("/ws/test-upload/{run_id}")
+async def websocket_endpoint(websocket: WebSocket, run_id: str):
+    await ws_manager.connect(run_id, websocket)
+    
+    try:
+        while True:
+            # Receive data from client
+            data = await websocket.receive()
+            
+            # Check if it's binary data (ZIP file)
+            if "bytes" in data:
+                binary_data = data["bytes"]
+                
+                # Generate filename with timestamp
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"received_{timestamp}.zip"
+                filepath = os.path.join(UPLOAD_DIR, filename)
+                
+                # Save the file
+                with open(filepath, 'wb') as f:
+                    f.write(binary_data)
+                
+                print(f"Received binary file: {filename}")
+                print(f"Size: {len(binary_data)} bytes")
+                
+                # Verify it's a valid ZIP file
+                is_valid_zip = False
+                zip_contents = []
+                
+                try:
+                    with zipfile.ZipFile(io.BytesIO(binary_data), 'r') as zf:
+                        is_valid_zip = True
+                        zip_contents = zf.namelist()
+                        print(f"ZIP contents: {zip_contents}")
+                except zipfile.BadZipFile:
+                    print("Warning: File is not a valid ZIP")
+                
+                # Send response back to client
+                response = {
+                    "status": "success",
+                    "message": f"File received successfully",
+                    "filename": filename,
+                    "size": len(binary_data),
+                    "saved_to": filepath,
+                    "is_valid_zip": is_valid_zip,
+                    "contents": zip_contents if is_valid_zip else [],
+                    "timestamp": timestamp
+                }
+                
+                # Send directly to this websocket connection
+                await websocket.send_json(response)
+                
+                # Also notify all connected clients for this run using send_log
+                await ws_manager.send_log(run_id, {
+                    "type": "file_uploaded",
+                    "data": response
+                })
+                
+            # Check if it's text/JSON data
+            elif "text" in data:
+                text_data = data["text"]
+                
+                try:
+                    # Try to parse as JSON
+                    json_data = json.loads(text_data)
+                    print(f"Received JSON: {json_data}")
+                    
+                    response = {
+                        "status": "received",
+                        "type": "json",
+                        "data": json_data
+                    }
+                    
+                except json.JSONDecodeError:
+                    # Plain text
+                    print(f"Received text: {text_data}")
+                    response = {
+                        "status": "received",
+                        "type": "text",
+                        "data": text_data
+                    }
+                
+                # Send directly to this websocket
+                await websocket.send_json(response)
+                
+    except WebSocketDisconnect:
+        ws_manager.disconnect(run_id, websocket)
+        print("Client disconnected")
+    except Exception as e:
+        print(f"Error: {e}")
+        ws_manager.disconnect(run_id, websocket)
+
+# Additional endpoint to list uploaded files
+@app.get("/uploads")
+async def list_uploads():
+    """List all uploaded files"""
+    files = []
+    for filename in os.listdir(UPLOAD_DIR):
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        if os.path.isfile(filepath):
+            files.append({
+                "filename": filename,
+                "size": os.path.getsize(filepath),
+                "modified": datetime.fromtimestamp(os.path.getmtime(filepath)).isoformat()
+            })
+    return {"files": files}
        
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)
