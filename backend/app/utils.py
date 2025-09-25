@@ -42,7 +42,7 @@ def save_email_to_firestore(email: str) -> None:
     })
 
 
-def save_hypothesis_to_firestore(run_id: str, hypothesis: str, user_id: str = None) -> None:
+def save_hypothesis_to_firestore(run_id: str, hypothesis: str, github_url: str, user_id: str = None) -> None:
     """Save hypothesis to Firestore collection 'hypotheses'"""
     db = get_firestore_client()
     doc_ref = db.collection(
@@ -50,6 +50,7 @@ def save_hypothesis_to_firestore(run_id: str, hypothesis: str, user_id: str = No
     doc_ref.set({
         "run_id": run_id,
         "hypothesis": hypothesis,
+        "github_url": github_url,
         "timestamp": firestore.SERVER_TIMESTAMP
     })
 

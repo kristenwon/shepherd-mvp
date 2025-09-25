@@ -650,24 +650,15 @@ async def start_run(challenge_name: str, run_id: str, job: JobRequest, tasks: Ba
 async def start_run_byor(
     run_id: str,
     tasks: BackgroundTasks,
-    github_url: str = Form(..., alias="github-url"),
-    tunnel_url: str = Form(..., alias="tunnel-url"),
+    github_url: str = Form(...),
+    tunnel_url: str = Form(...),
     assets: Optional[UploadFile] = File(None)
 ):
-    """
-    Start a new run with multipart form data support and Firestore tracking.
-
-    Args:
-        run_id: Unique identifier for the run
-        github_url: GitHub repository URL (form field: github-url)
-        tunnel_url: Tunnel URL for the run (form field: tunnel-url)
-        assets: Optional ZIP file containing assets
-    """
-
-    # Handle the uploaded file if provided
-    assets_path = None
+    # Initialize variables
+    assets_data = None
     assets_metadata = None
 
+    # Handle the uploaded file if provided (read directly into memory)
     if assets:
         # Check file size limit (100MB)
         MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
@@ -677,74 +668,60 @@ async def start_run_byor(
                 detail=f"File too large. Maximum size is {MAX_FILE_SIZE / (1024*1024)}MB"
             )
 
-        # Create uploads directory if it doesn't exist
-        upload_dir = Path("./uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save the uploaded file
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        assets_filename = f"{run_id}_assets_{timestamp}.zip"
-        assets_path = upload_dir / assets_filename
-
         try:
-            # Save the uploaded file
-            with open(assets_path, "wb") as buffer:
-                shutil.copyfileobj(assets.file, buffer)
+            # Read the file directly into memory
+            assets_data = await assets.read()
+            print(
+                f"📦 Loaded assets file into memory: {assets.filename} ({len(assets_data)} bytes)")
 
-            print(f"📦 Saved assets file: {assets_path}")
-
-            # Prepare assets metadata for Firestore
+            # Basic metadata for logging (not for storage)
             assets_metadata = {
                 "original_filename": assets.filename,
                 "content_type": assets.content_type,
-                "size": assets.size,
-                "saved_filename": assets_filename,
-                "upload_timestamp": timestamp
+                "size": len(assets_data)
             }
 
-            # Verify it's a valid ZIP file and add to metadata
+            # Verify it's a valid ZIP file
+            import io
             try:
-                with zipfile.ZipFile(assets_path, 'r') as zf:
+                with zipfile.ZipFile(io.BytesIO(assets_data), 'r') as zf:
                     zip_contents = zf.namelist()
                     assets_metadata["is_valid_zip"] = True
                     assets_metadata["file_count"] = len(zip_contents)
-                    # Store first 100 file names
-                    assets_metadata["contents"] = zip_contents[:100]
                     print(f"   ZIP contents: {len(zip_contents)} files")
             except zipfile.BadZipFile:
-                print(f"   Warning: Uploaded file is not a valid ZIP")
-                assets_metadata["is_valid_zip"] = False
-                assets_metadata["file_count"] = 0
-                assets_metadata["contents"] = []
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid ZIP file provided"
+                )
 
         except Exception as e:
-            print(f"Error saving assets file: {e}")
-            if assets_path and assets_path.exists():
-                assets_path.unlink()  # Clean up on error
-            assets_path = None
-            assets_metadata = None
+            print(f"Error processing assets file: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Error processing assets file: {str(e)}"
+            )
 
     # Create job dictionary with all the form data
     job_data = {
         "github_url": github_url,
         "tunnel_url": tunnel_url,
-        "assets_path": str(assets_path) if assets_path else None
+        "has_assets": assets_data is not None
     }
 
-    # Save initial request to Firestore with "pending" status
+    # Save initial request to Firestore with "pending" status (no file data)
     try:
         firestore_data = save_run_request_to_firestore(
             run_id=run_id,
             github_url=github_url,
             tunnel_url=tunnel_url,
-            assets_path=str(assets_path) if assets_path else None,
-            assets_metadata=assets_metadata,
-            status="pending"  # Initial status before checking capacity
+            assets_path=None,  # No longer storing path
+            assets_metadata=assets_metadata,  # Basic metadata only
+            status="pending"
         )
         print(f"💾 Saved run request to Firestore: {run_id}")
     except Exception as e:
         print(f"Error saving to Firestore: {e}")
-        # Continue even if Firestore save fails (optional: you could raise HTTPException here)
 
     # Add run to manager (will either start or return at_capacity)
     result = await run_manager.add_run(run_id, job_data)
@@ -762,14 +739,12 @@ async def start_run_byor(
         print(f"🚀 Starting BYOR MAS for run {run_id}")
         print(f"   GitHub URL: {github_url}")
         print(f"   Tunnel URL: {tunnel_url}")
-        if assets_path:
-            print(f"   Assets: {assets_path}")
+        if assets_data:
+            print(f"   Assets: In memory ({len(assets_data)} bytes)")
 
         # Create the WebSocket-based input handler
         input_handler = byor_bridge.create_ws_input_handler(
             run_id, input_queues[run_id])
-
-        assets_data = open(assets_path, 'rb').read() if assets_path else None
 
         # Wrapper to handle completion and update Firestore
         async def run_with_completion():
@@ -778,8 +753,8 @@ async def start_run_byor(
                     run_id=run_id,
                     github_url=github_url,
                     tunnel_url=tunnel_url,
-                    assets_data=assets_data,
-                    job=job_data,  # Pass the job_data dict directly
+                    assets_data=assets_data,  # Pass the in-memory bytes directly
+                    job=job_data,
                     input_handler=input_handler,
                     ws_manager=ws_manager,
                     log_dir="./backend/logs",
@@ -827,11 +802,7 @@ async def start_run_byor(
                 if run_id in input_queues:
                     del input_queues[run_id]
 
-                # Optionally clean up assets file after processing
-                # Uncomment if you want to delete files after processing:
-                # if assets_path and Path(assets_path).exists():
-                #     Path(assets_path).unlink()
-                #     print(f"🗑️ Cleaned up assets file: {assets_path}")
+                # No file cleanup needed since we're not saving files
 
         # Start MAS in background
         tasks.add_task(run_with_completion)
@@ -850,18 +821,13 @@ async def start_run_byor(
         except Exception as e:
             print(f"Error updating Firestore at_capacity status: {e}")
 
-        # Clean up uploaded file if we're at capacity
-        if assets_path and assets_path.exists():
-            assets_path.unlink()
-            print(f"🗑️ Cleaned up assets file due to capacity: {assets_path}")
-
         return JSONResponse({
             "status": "at_capacity",
             "message": result["message"]
-        }, status_code=503)  # 503 Service Unavailable
+        }, status_code=503)
 
     else:
-        # Unexpected status - update Firestore and clean up
+        # Unexpected status - update Firestore
         try:
             update_run_status_in_firestore(
                 run_id,
@@ -870,11 +836,6 @@ async def start_run_byor(
             )
         except Exception as e:
             print(f"Error updating Firestore error status: {e}")
-
-        # Clean up uploaded file on error
-        if assets_path and assets_path.exists():
-            assets_path.unlink()
-            print(f"🗑️ Cleaned up assets file due to error: {assets_path}")
 
         raise HTTPException(
             status_code=500,

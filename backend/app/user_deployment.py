@@ -48,20 +48,22 @@ def stitch_sources(base: Path, sources: Dict[str, Any]) -> str:
     return "// source not fully resolved"
 
 
-def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str) -> List[Dict[str, Any]]:
+def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str, tunnel_url: str):
     """Modified version that saves to specified output directory"""
     base = Path(input_dir)
     repo_path = Path(output_dir)  # Use the provided MAS deployments path
     repo_path.mkdir(parents=True, exist_ok=True)
-    contract_assets = []
 
     # 1) load artifacts (Foundry)
     artifacts = load_foundry_artifacts(base)
+    for a in artifacts:
+        print(f"found artifact with name {a['contract_name']}")
 
     # 2) discover addresses
-    targets = {}
+    targets = {}  # {label -> address}
     broadcast_dir = base / "broadcast"
 
+    # Look for run-latest.json in broadcast/*/31337/
     for run_latest_file in broadcast_dir.rglob("*/31337/run-latest.json"):
         with open(run_latest_file, 'r') as f:
             broadcast_data = json.load(f)
@@ -72,19 +74,27 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
                 contract_address = tx.get("contractAddress")
                 if contract_name and contract_address:
                     targets[contract_name] = contract_address
+    print(targets)
 
-    # 3) match and save to MAS deployments
+    # 3) match deployed contracts to artifacts
+
     for label, addr in targets.items():
+        print(f"Looking for artifact named: {label}")
+
+        # Match by contract name instead of bytecode
         art = None
         for artifact in artifacts:
             if artifact["contract_name"] == label:
                 art = artifact
+                print(f"✓ Found matching artifact: {label}")
                 break
 
         if not art:
+            print(f"❌ No artifact found with name {label}")
             continue
 
         source_text = stitch_sources(base, art["sources"])
+        print(f"source code: {source_text}")
 
         asset = {
             "contract_name": label,
@@ -92,51 +102,58 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
             "bytecode": "0x" + art["creation"].lstrip("0x"),
             "source_code": source_text or "// source not fully resolved",
             "deployed_address": Web3.to_checksum_address(addr),
-            "network_url": "http://127.0.0.1:8545"
+            "network_url": tunnel_url
         }
 
         short = addr[:6] + "…" + addr[-4:]
         output_file = repo_path / f"{asset['contract_name']}_{short}.json"
         output_file.write_text(json.dumps(asset, indent=2), encoding="utf-8")
 
-        print(f"Created asset in MAS: {output_file}")
-        contract_assets.append(asset)
+        print(f"Created asset: {output_file}")
+        return repo_path
 
-    return contract_assets
+
+def load_contract_assets_from_deployments(repo_name: str):
+    """
+    Load contract assets that were saved by shepherd-mvp in deployments folder
+
+    Args:
+        repo_name: Name of the repository (folder name in deployments)
+
+    Returns:
+        tuple: (repo_path, contract_assets)
+    """
+    repo_path = Path(BASE_DIR) / "deployments" / repo_name
+    contract_assets = []
+
+    if not repo_path.exists():
+        raise ValueError(f"Deployments folder not found: {repo_path}")
+
+    # Load all JSON files from the deployments directory
+    json_files = list(repo_path.glob("*.json"))
+
+    if not json_files:
+        raise ValueError(f"No contract assets found in: {repo_path}")
+
+    for json_file in json_files:
+        with open(json_file, 'r') as f:
+            asset = json.load(f)
+            contract_assets.append(asset)
+
+    print(f"📦 Loaded {len(contract_assets)} contract assets from {repo_path}")
+
+    return repo_path, contract_assets
 
 
 # Should contain out/, broadcast/, src/
-TEST_INPUT_DIR = Path(__file__).parent.parent / "uploads"
+TEST_INPUT_DIR = "/Users/avnihulyalkar/Desktop/Shepherd/blackRabbit/src/api/scripts/my-assets"
 TEST_REPO_NAME = "my-assets"
 # TEST_RPC_URL = "http://127.0.0.1:8545"
 
 
 def test_basic():
-    # Add debugging to see what's happening
-    test_dir = Path("/Users/chachachoco/shepherd-mvp/uploads/my-assets")
-
-    print(f"Looking in: {test_dir}")
-    print(f"Directory exists: {test_dir.exists()}")
-
-    if test_dir.exists():
-        print(f"Contents: {list(test_dir.iterdir())}")
-
-        out_dir = test_dir / "out"
-        print(f"out/ exists: {out_dir.exists()}")
-        if out_dir.exists():
-            print(f"out/ contents: {list(out_dir.iterdir())}")
-
-        broadcast_dir = test_dir / "broadcast"
-        print(f"broadcast/ exists: {broadcast_dir.exists()}")
-        if broadcast_dir.exists():
-            print(
-                f"broadcast/ contents: {list(broadcast_dir.rglob('*.json'))}")
-
     # Run the builder
-    repo_path, contract_assets = build_contract_assets(
-        str(test_dir), TEST_REPO_NAME)
-
-    print(f"Found {len(contract_assets)} contracts")
+    build_contract_assets(TEST_INPUT_DIR, TEST_REPO_NAME)
 
     # Check deployments folder was created
     deployments_dir = Path(BASE_DIR) / "deployments" / TEST_REPO_NAME
@@ -144,14 +161,6 @@ def test_basic():
 
     # Check that JSON files were created
     json_files = list(deployments_dir.glob("*.json"))
-
-    if len(json_files) == 0:
-        print("No assets created because:")
-        print("- No artifacts found in out/")
-        print("- Or no deployed contracts found in broadcast/")
-        print("- Or no matching between artifacts and deployments")
-        return
-
     assert len(json_files) > 0, "No asset files created"
 
     # Verify basic structure of first asset

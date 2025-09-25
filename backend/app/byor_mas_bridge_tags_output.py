@@ -357,7 +357,7 @@ class PromptDetector:
 class TagAwareOutputBuffer:
     """Buffer that ONLY streams tagged content, ignoring regular output"""
 
-    def __init__(self, ws_manager, run_id):
+    def __init__(self, ws_manager, run_id, github_url=None, tunnel_url=None):
         self.ws_manager = ws_manager
         self.run_id = run_id
         self.parser = TagParser()
@@ -380,6 +380,9 @@ class TagAwareOutputBuffer:
 
         # Track if we've recently handled a hypothesis prompt via USER_INPUT
         self.handled_hypothesis_via_tag = False
+        self.github_url = github_url
+        self.tunnel_url = tunnel_url
+        self.auto_response_pending = None
 
     async def add_char(self, char: str):
         """Character-by-character processing - only send when inside tags"""
@@ -416,7 +419,6 @@ class TagAwareOutputBuffer:
                 parsed = self._parse_tag_content(
                     self.current_tag_type, self.current_tag_content)
 
-                # IMPORTANT: Handle USER_INPUT tags specially
                 if parsed and self.current_tag_type == "USER_INPUT":
                     # Send the tag to WebSocket first
                     if self.ws_manager:
@@ -429,7 +431,7 @@ class TagAwareOutputBuffer:
                     prompt_text = tag_data.get('prompt', '')
                     value = tag_data.get('value')
 
-                    # If value is null, set up for input collection
+                    # If value is null (needs input)
                     if value is None and prompt_text:
                         # Clean up the prompt text
                         clean_prompt = prompt_text.strip()
@@ -721,14 +723,15 @@ async def launch_mas_interactive(
         mas_deployments_dir = mas_repo / "deployments" / repo_name
         mas_deployments_dir.mkdir(parents=True, exist_ok=True)
 
-        contract_assets = build_contract_assets_to_mas(
+        build_contract_assets_to_mas(
             input_dir=str(extract_dir),
             output_dir=str(mas_deployments_dir),
-            repo_name=repo_name
+            repo_name=repo_name,
+            tunnel_url=tunnel_url,
         )
 
         print(
-            f"📍 Saved {len(contract_assets)} contract assets to MAS: {mas_deployments_dir}")
+            f"📍 Saved contract assets to MAS: {mas_deployments_dir}")
 
     # Temp directory and extracted files are automatically deleted here
     print(f"🗑️ Cleaned up temporary extraction directory")
@@ -797,7 +800,12 @@ async def launch_mas_interactive(
             })
 
         # Initialize output buffer with tag support
-        output_buffer = TagAwareOutputBuffer(ws_manager, run_id)
+        output_buffer = TagAwareOutputBuffer(
+            ws_manager,
+            run_id,
+            github_url=github_url,  # Pass the URLs here
+            tunnel_url=tunnel_url
+        )
         detector = output_buffer.prompt_detector
 
         # Main output processing loop (character by character like mas_bridge_4.py)
@@ -847,9 +855,8 @@ async def launch_mas_interactive(
                         if user_input is not None:
                             if is_hypothesis:
                                 try:
-                                    from .utils import save_hypothesis_to_firestore
                                     save_hypothesis_to_firestore(
-                                        run_id, user_input)
+                                        run_id, user_input, github_url)
                                     print(
                                         f"[SHEPHERD] Saved hypothesis to Firebase for run {run_id}")
                                 except Exception as e:
@@ -888,6 +895,52 @@ async def launch_mas_interactive(
                                     f"[SHEPHERD] Process terminated while sending input: {e}")
                                 break
 
+                        no_output_count = 0
+                        continue
+
+                    # CHECK FOR AUTO-RESPONSE PENDING (GitHub URL or Tunnel URL)
+                    if hasattr(output_buffer, 'auto_response_pending') and output_buffer.auto_response_pending:
+                        response_type, prompt_text = output_buffer.auto_response_pending
+                        print(
+                            f"[SHEPHERD DEBUG] Auto-response pending: {response_type} for prompt: {prompt_text}")
+                        output_buffer.auto_response_pending = None
+
+                        # Determine which value to send based on response type
+                        if response_type == 'github_url' and output_buffer.github_url:
+                            auto_value = output_buffer.github_url
+                            print(
+                                f"[SHEPHERD] Auto-sending GitHub URL: {auto_value}")
+                        elif response_type == 'tunnel_url' and output_buffer.tunnel_url:
+                            auto_value = output_buffer.tunnel_url
+                            print(
+                                f"[SHEPHERD] Auto-sending Tunnel URL: {auto_value}")
+                        else:
+                            # Shouldn't happen, but fallback to normal input
+                            print(
+                                f"[SHEPHERD] Warning: No auto-value for {response_type}")
+                            print(
+                                f"[SHEPHERD DEBUG] github_url={output_buffer.github_url}, tunnel_url={output_buffer.tunnel_url}")
+                            output_buffer.pending_prompt = prompt_text
+                            output_buffer.needs_input = True
+                            continue
+
+                        # Send the auto-response
+                        try:
+                            if process.returncode is None:
+                                process.stdin.write(
+                                    (auto_value + '\n').encode())
+                                await process.stdin.drain()
+                                print(
+                                    f"[SHEPHERD] Successfully sent auto-response for {response_type}: {auto_value}")
+
+                                # Clear buffers
+                                buffer = ""
+                                line_buffer = ""
+                                detector.last_input_time = current_time
+                        except (BrokenPipeError, RuntimeError) as e:
+                            print(
+                                f"[SHEPHERD] Process terminated while sending auto-response: {e}")
+                            break
                         no_output_count = 0
                         continue
 
@@ -966,7 +1019,59 @@ async def launch_mas_interactive(
                             continue
                         if prompt_line in detector.seen_prompts:
                             continue
+                        if "Please enter the repository github url" in prompt_line:
+                            print(
+                                f"[SHEPHERD] Auto-responding to repo name prompt with: {github_url}")
+                            try:
+                                if process.returncode is None:
+                                    process.stdin.write(
+                                        (github_url + '\n').encode())
+                                    await process.stdin.drain()
+                                buffer = ""
+                                line_buffer = ""
+                                detector.last_input_time = current_time
+                            except (BrokenPipeError, RuntimeError) as e:
+                                print(
+                                    f"[SHEPHERD] Process terminated while sending input: {e}")
+                                break
+                            no_output_count = 0
+                            continue
 
+                        if "Please enter the repository name (folder in deployments)" in prompt_line:
+                            print(
+                                f"[SHEPHERD] Auto-responding to repo name prompt with: {repo_name}")
+                            try:
+                                if process.returncode is None:
+                                    process.stdin.write(
+                                        (repo_name + '\n').encode())
+                                    await process.stdin.drain()
+                                buffer = ""
+                                line_buffer = ""
+                                detector.last_input_time = current_time
+                            except (BrokenPipeError, RuntimeError) as e:
+                                print(
+                                    f"[SHEPHERD] Process terminated while sending input: {e}")
+                                break
+                            no_output_count = 0
+                            continue
+
+                        if "Please enter the tunnel url" in prompt_line:
+                            print(
+                                f"[SHEPHERD] Auto-responding to repo name prompt with: {tunnel_url}")
+                            try:
+                                if process.returncode is None:
+                                    process.stdin.write(
+                                        (tunnel_url + '\n').encode())
+                                    await process.stdin.drain()
+                                buffer = ""
+                                line_buffer = ""
+                                detector.last_input_time = current_time
+                            except (BrokenPipeError, RuntimeError) as e:
+                                print(
+                                    f"[SHEPHERD] Process terminated while sending input: {e}")
+                                break
+                            no_output_count = 0
+                            continue
                         output_buffer.clear_prompt()
                         detector.seen_prompts.add(prompt_line)
 
