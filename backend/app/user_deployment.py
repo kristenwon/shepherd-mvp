@@ -37,6 +37,7 @@ def stitch_sources(base: Path, sources: Dict[str, Any]) -> str:
     # Find source files that look like main contracts (in src/)
     for file_path, file_data in sources.items():
         if file_path.startswith("src/") and file_path.endswith(".sol"):
+            print(f"Found source file: {file_path}")
 
             full_path = base / file_path
             if full_path.exists():
@@ -74,11 +75,11 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
                 if contract_name and contract_address:
                     targets[contract_name] = contract_address
 
-    # 3) match deployed contracts to artifacts by matching contract names
+    # 3) match deployed contracts to artifacts
 
     for label, addr in targets.items():
 
-        # Match by contract name
+        # Match by contract name instead of bytecode
         art = None
         for artifact in artifacts:
             if artifact["contract_name"] == label:
@@ -86,6 +87,7 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
                 break
 
         if not art:
+            print(f"No artifact found with name {label}")
             continue
 
         source_text = stitch_sources(base, art["sources"])
@@ -96,7 +98,7 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
             "bytecode": "0x" + art["creation"].lstrip("0x"),
             "source_code": source_text or "// source not fully resolved",
             "deployed_address": Web3.to_checksum_address(addr),
-            "network_url": "http://127.0.0.1:8545"
+            "network_url": tunnel_url
         }
 
         short = addr[:6] + "…" + addr[-4:]
@@ -104,8 +106,7 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
         output_file.write_text(json.dumps(asset, indent=2), encoding="utf-8")
 
         print(f"Created asset: {output_file}")
-        contract_assets.append(asset)
-    return repo_path, contract_assets
+    return repo_path
 
 
 def load_contract_assets_from_deployments(repo_name: str):
