@@ -53,11 +53,10 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
     base = Path(input_dir)
     repo_path = Path(output_dir)  # Use the provided MAS deployments path
     repo_path.mkdir(parents=True, exist_ok=True)
+    contract_assets: List[ContractAsset] = []
 
     # 1) load artifacts (Foundry)
     artifacts = load_foundry_artifacts(base)
-    for a in artifacts:
-        print(f"found artifact with name {a['contract_name']}")
 
     # 2) discover addresses
     targets = {}  # {label -> address}
@@ -74,27 +73,22 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
                 contract_address = tx.get("contractAddress")
                 if contract_name and contract_address:
                     targets[contract_name] = contract_address
-    print(targets)
 
-    # 3) match deployed contracts to artifacts
+    # 3) match deployed contracts to artifacts by matching contract names
 
     for label, addr in targets.items():
-        print(f"Looking for artifact named: {label}")
 
-        # Match by contract name instead of bytecode
+        # Match by contract name
         art = None
         for artifact in artifacts:
             if artifact["contract_name"] == label:
                 art = artifact
-                print(f"✓ Found matching artifact: {label}")
                 break
 
         if not art:
-            print(f"❌ No artifact found with name {label}")
             continue
 
         source_text = stitch_sources(base, art["sources"])
-        print(f"source code: {source_text}")
 
         asset = {
             "contract_name": label,
@@ -102,7 +96,7 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
             "bytecode": "0x" + art["creation"].lstrip("0x"),
             "source_code": source_text or "// source not fully resolved",
             "deployed_address": Web3.to_checksum_address(addr),
-            "network_url": tunnel_url
+            "network_url": "http://127.0.0.1:8545"
         }
 
         short = addr[:6] + "…" + addr[-4:]
@@ -110,7 +104,8 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
         output_file.write_text(json.dumps(asset, indent=2), encoding="utf-8")
 
         print(f"Created asset: {output_file}")
-        return repo_path
+        contract_assets.append(asset)
+    return repo_path, contract_assets
 
 
 def load_contract_assets_from_deployments(repo_name: str):
@@ -143,39 +138,3 @@ def load_contract_assets_from_deployments(repo_name: str):
     print(f"📦 Loaded {len(contract_assets)} contract assets from {repo_path}")
 
     return repo_path, contract_assets
-
-
-# Should contain out/, broadcast/, src/
-TEST_INPUT_DIR = "/Users/avnihulyalkar/Desktop/Shepherd/blackRabbit/src/api/scripts/my-assets"
-TEST_REPO_NAME = "my-assets"
-# TEST_RPC_URL = "http://127.0.0.1:8545"
-
-
-def test_basic():
-    # Run the builder
-    build_contract_assets(TEST_INPUT_DIR, TEST_REPO_NAME)
-
-    # Check deployments folder was created
-    deployments_dir = Path(BASE_DIR) / "deployments" / TEST_REPO_NAME
-    assert deployments_dir.exists(), "Deployments directory not created"
-
-    # Check that JSON files were created
-    json_files = list(deployments_dir.glob("*.json"))
-    assert len(json_files) > 0, "No asset files created"
-
-    # Verify basic structure of first asset
-    with open(json_files[0], 'r') as f:
-        asset = json.load(f)
-
-    required_fields = ["contract_name", "abi",
-                       "bytecode", "source_code", "deployed_address"]
-    for field in required_fields:
-        assert field in asset, f"Missing field: {field}"
-
-    print(f"✓ Created {len(json_files)} asset(s)")
-    print(
-        f"✓ First asset: {asset['contract_name']} at {asset['deployed_address']}")
-
-
-if __name__ == "__main__":
-    test_basic()
