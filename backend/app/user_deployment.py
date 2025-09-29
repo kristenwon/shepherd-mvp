@@ -31,20 +31,65 @@ def load_foundry_artifacts(base: Path) -> List[Dict[str, Any]]:
     return artifacts
 
 
-def stitch_sources(base: Path, sources: Dict[str, Any]) -> str:
-    """Get source code for just the main contract file"""
+def stitch_sources(base: Path, sources: Dict[str, Any], contract_name: str = None) -> str:
+    """Get source code for the contract, searching by contract name if provided"""
 
-    # Find source files that look like main contracts (in src/)
-    for file_path, file_data in sources.items():
+    # If we have a contract name, try to find the matching source file
+    if contract_name:
+        print(f"Looking for source file for contract: {contract_name}")
+
+        # For Mock contracts, look in test files first
+        if contract_name.startswith("Mock"):
+            # Check test directory for mock contracts
+            test_dir = base / "test"
+            if test_dir.exists():
+                for test_file in test_dir.glob("**/*.sol"):
+                    if test_file.is_file():
+                        content = test_file.read_text(encoding="utf-8")
+                        # Check if this file contains the mock contract
+                        if f"contract {contract_name}" in content:
+                            print(
+                                f"Found {contract_name} in: {test_file.relative_to(base)}")
+                            return content
+
+            # If not found in test, it might be using a real contract as mock
+            # Strip "Mock" prefix and look for the base contract
+            base_contract_name = contract_name.replace("Mock", "")
+            for file_path in sources.keys():
+                if base_contract_name in file_path and file_path.endswith(".sol"):
+                    full_path = base / file_path
+                    if full_path.exists():
+                        print(
+                            f"Using base contract for {contract_name}: {file_path}")
+                        return full_path.read_text(encoding="utf-8")
+
+        # For non-mock contracts, look for exact match in src/
+        else:
+            # First try exact filename match
+            expected_file = f"src/{contract_name}.sol"
+            if expected_file in sources:
+                full_path = base / expected_file
+                if full_path.exists():
+                    print(f"Found exact match: {expected_file}")
+                    return full_path.read_text(encoding="utf-8")
+
+            # Otherwise search all source files for the contract definition
+            for file_path in sources.keys():
+                if file_path.endswith(".sol"):
+                    full_path = base / file_path
+                    if full_path.exists():
+                        content = full_path.read_text(encoding="utf-8")
+                        if f"contract {contract_name}" in content:
+                            print(f"Found {contract_name} in: {file_path}")
+                            return content
+
+    # Fallback: return first source file in src/ (original behavior)
+    for file_path in sources.keys():
         if file_path.startswith("src/") and file_path.endswith(".sol"):
-            print(f"Found source file: {file_path}")
-
             full_path = base / file_path
             if full_path.exists():
-                print(f"Reading from: {full_path}")
+                print(f"Fallback - using: {file_path}")
                 return full_path.read_text(encoding="utf-8")
-            else:
-                print(f"Warning: File not found at {full_path}")
 
     return "// source not fully resolved"
 
@@ -52,9 +97,8 @@ def stitch_sources(base: Path, sources: Dict[str, Any]) -> str:
 def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str, tunnel_url: str):
     """Modified version that saves to specified output directory"""
     base = Path(input_dir)
-    repo_path = Path(output_dir)  # Use the provided MAS deployments path
+    repo_path = Path(output_dir)
     repo_path.mkdir(parents=True, exist_ok=True)
-    contract_assets: List[ContractAsset] = []
 
     # 1) load artifacts (Foundry)
     artifacts = load_foundry_artifacts(base)
@@ -76,7 +120,6 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
                     targets[contract_name] = contract_address
 
     # 3) match deployed contracts to artifacts
-
     for label, addr in targets.items():
 
         # Match by contract name instead of bytecode
@@ -90,7 +133,8 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
             print(f"No artifact found with name {label}")
             continue
 
-        source_text = stitch_sources(base, art["sources"])
+        # Pass the contract name to stitch_sources
+        source_text = stitch_sources(base, art["sources"], contract_name=label)
 
         asset = {
             "contract_name": label,
@@ -106,6 +150,7 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
         output_file.write_text(json.dumps(asset, indent=2), encoding="utf-8")
 
         print(f"Created asset: {output_file}")
+
     return repo_path
 
 
