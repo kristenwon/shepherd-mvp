@@ -3,10 +3,10 @@ import shutil
 from fastapi import File, UploadFile, Form
 import asyncio
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, status
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 import json
 from datetime import datetime
 from enum import Enum
@@ -34,7 +34,7 @@ from typing import Optional
 import zipfile
 import io
 from .utils import save_run_request_to_firestore, update_run_status_in_firestore
-
+from .firebase_storage import init_firebase, ReportIssueService
 load_dotenv()
 
 
@@ -42,7 +42,7 @@ load_dotenv()
 async def lifespan(app: FastAPI):
     # === STARTUP ===
     print("🚀 Starting Shepherd service...")
-
+    init_firebase()
     # Clean up orphaned MAS processes from previous session
     if run_manager.pid_file.exists():
         print("🧹 Cleaning up orphaned processes from previous session...")
@@ -1095,9 +1095,9 @@ async def websocket_endpoint(websocket: WebSocket, run_id: str):
 # Additional endpoint to list uploaded files
 
 
-@app.get("/uploads")
+@app.get("/contract-assets-uploads")
 async def list_uploads():
-    """List all uploaded files"""
+    """List all contract assets uploaded files"""
     files = []
     for filename in os.listdir(UPLOAD_DIR):
         filepath = os.path.join(UPLOAD_DIR, filename)
@@ -1108,6 +1108,47 @@ async def list_uploads():
                 "modified": datetime.fromtimestamp(os.path.getmtime(filepath)).isoformat()
             })
     return {"files": files}
+
+
+@app.post(
+    "/report-issue",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new report issue",
+    response_description="Report created",
+)
+async def create_report_issue(
+    text: str = Form(..., description="Report body text"),
+    images: Optional[List[UploadFile]] = File(
+        None, description="One or more image files"),
+):
+    """
+    Thin endpoint that hands off to ReportService.
+    """
+    report_service = ReportIssueService(
+        collection_name="report_issues",
+        prefix="report-issues/",
+        make_public_images=False,  # set True if you want public URLs
+    )
+    # Normalize uploads to tuples (filename, content_type, bytes)
+    materialized: List[Tuple[str, str, bytes]] = []
+    for f in images or []:
+        try:
+            data = await f.read()
+        finally:
+            await f.close()
+        materialized.append(
+            (f.filename or "", f.content_type or "application/octet-stream", data))
+
+    try:
+        created = report_service.create_report(text=text, images=materialized)
+        return JSONResponse(status_code=status.HTTP_201_CREATED, content=created)
+    except ValueError as ve:
+        # validation errors (image type/size/count)
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        # unexpected server error
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create report: {e}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)

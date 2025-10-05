@@ -12,6 +12,8 @@ from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
 from .user_deployment import build_contract_assets_to_mas
+import tempfile
+
 load_dotenv()
 
 
@@ -876,13 +878,12 @@ async def launch_mas_interactive(
     repo_name = repo_display_name(github_url)
 
     # Use a temporary directory for extraction
-    import tempfile
-    # Keep parent=True to put temp dir in current working directory for debugging
-    temp_dir = tempfile.mkdtemp(prefix=f"mas_extract_{run_id}_", dir=".")
-    print(f"🔍 DEBUG: Temporary directory created at: {temp_dir}")
-    print(f"⚠️  NOTE: Temporary directory will NOT be deleted (debug mode)")
 
     try:
+        # Use a temporary directory that auto-deletes when the block ends
+        with tempfile.TemporaryDirectory(prefix=f"mas_extract_{run_id}_") as temp_dir:
+            print(f"Temporary directory created at: {temp_dir}")
+
         extract_dir = Path(temp_dir) / "extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
 
