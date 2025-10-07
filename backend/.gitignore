@@ -47,3 +47,4 @@ Thumbs.db
 /myenv
 firebase_service_account.json
 /newenv
+test_*.py
