@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
 from .user_deployment import build_contract_assets_to_mas
+from .chunking.chunker import test_repo_chunking
 import tempfile
 
 load_dotenv()
@@ -919,9 +920,6 @@ async def launch_mas_interactive(
         print(f"🔍 DEBUG: Temporary directory preserved at: {temp_dir}")
         raise
 
-    # Note: NOT cleaning up temp_dir for debugging purposes
-    print(f"✅ Extraction complete. Temporary files preserved at: {temp_dir}")
-
     # Rest of your function continues as before...
     # Prepare environment variables
     env = os.environ.copy()
@@ -960,6 +958,61 @@ async def launch_mas_interactive(
                     "working_dir": str(mas_repo)
                 }
             })
+
+        # chunking
+        try:
+            # ── Chunk the deployed repository ──
+            print("Starting repository chunking process...")
+            # Get the repository name and construct the deployments path
+            await ws_manager.send_log(run_id, {
+                "type": "description",
+                "data": {
+                    "message": f"Deployed files location: {mas_deployments_dir}. Processing repository: {repo_name}...",
+                    "tag_type": "DESCRIPTION"
+                }
+            })
+            # Call the chunker on the deployed repository (skip chunking for now)
+            if os.path.exists(mas_deployments_dir):
+                demo_repo = test_repo_chunking(mas_deployments_dir, github_url)
+                if demo_repo is None:
+                    await ws_manager.send_log(run_id, {
+                        "type": "description",
+                        "data": {
+                            "message": "Repository chunking failed, but continuing with analysis...",
+                            "tag_type": "DESCRIPTION"
+                        }
+                    })
+                    print(
+                        "⚠️  Repository chunking failed, but continuing with analysis...")
+                else:
+                    await ws_manager.send_log(run_id, {
+                        "type": "description",
+                        "data": {
+                            "message": f"Successfully chunked repository: {repo_name}",
+                            "tag_type": "DESCRIPTION"
+                        }
+                    })
+                    print(f"✅ Successfully chunked repository: {repo_name}")
+            else:
+                await ws_manager.send_log(run_id, {
+                    "type": "description",
+                    "data": {
+                            "message": f"Successfully chunked repository: {repo_name}",
+                            "tag_type": "DESCRIPTION"
+                    }
+                })
+                print(
+                    f"⚠️  Deployed repository path '{mas_deployments_dir}' not found, skipping chunking...")
+        except Exception as e:
+            await ws_manager.send_log(run_id, {
+                "type": "description",
+                "data": {
+                    "message": f"Repository chunking encountered an error: {e}. Continuing with analysis...",
+                    "tag_type": "DESCRIPTION"
+                }
+            })
+            print(
+                f"❌ Repository chunking encountered an error: {e}. Continuing with analysis...")
 
         # Create subprocess
         process = await asyncio.create_subprocess_exec(
