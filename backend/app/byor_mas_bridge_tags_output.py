@@ -850,6 +850,8 @@ async def launch_mas_interactive(
     """
     Launch MAS subprocess with tag-based streaming and error handling
     """
+    print(f'job received: {job}')
+
     # Create log directory if it doesn't exist
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)

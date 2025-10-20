@@ -6,9 +6,10 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, status
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
+import traceback
 from typing import Dict, Optional, List, Tuple
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import os
 import time
@@ -34,7 +35,11 @@ from typing import Optional
 import zipfile
 import io
 from .utils import save_run_request_to_firestore, update_run_status_in_firestore
-from .firebase_storage import init_firebase, ReportIssueService
+from .firebase_storage import init_firebase, ReportIssueService, upload_log_file, save_run_session, get_user_sessions, save_error_log_to_storage, get_run_session
+from fastapi import Depends, Header, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+
 load_dotenv()
 
 
@@ -146,7 +151,7 @@ class RunManager:
                 self.active_runs[run_id] = {
                     "run_id": run_id,
                     "status": RunStatus.RUNNING,
-                    "started_at": datetime.utcnow().isoformat(),
+                    "started_at": datetime.now(timezone.utc).isoformat(),
                     "job_data": job_data
                 }
                 return {"status": "started", "run_id": run_id}
@@ -641,9 +646,134 @@ async def start_run(challenge_name: str, run_id: str, job: JobRequest, tasks: Ba
         raise HTTPException(
             status_code=500, detail="Unexpected status from run manager")
 
-# Add these imports at the top of your main.py
+security = HTTPBearer()
 
-# Complete endpoint with Firestore integration
+
+async def get_user_from_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> dict:
+    """
+    Extract and validate JWT token, return user data including ID and email.
+
+    Returns:
+        dict with 'id', 'email', 'sub', etc.
+    """
+    try:
+        token = credentials.credentials
+
+        # Decode the JWT token
+        # If you need to verify signature, provide your secret key:
+        # payload = jwt.decode(token, YOUR_SECRET_KEY, algorithms=["HS256"])
+
+        # For now, decode without verification (if you trust the source)
+        payload = jwt.decode(token, options={"verify_signature": False})
+
+        # Extract user information
+        user_id = payload.get("id")
+        user_email = payload.get("email")
+        user_sub = payload.get("sub")
+
+        if not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid token: missing user ID"
+            )
+
+        return {
+            "id": user_id,
+            "email": user_email,
+            "sub": user_sub,
+            "full_payload": payload
+        }
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail=f"Authentication error: {str(e)}")
+
+
+async def handle_log_upload_and_session(
+    run_id: str,
+    user_id: str,
+    user_email: str,
+    log_file_path: Optional[str],
+    github_url: str,
+    tunnel_url: str,
+    status: str,
+    result: dict,
+    assets_data: Optional[bytes],
+    error_info: Optional[tuple] = None
+):
+    """Handle log upload and session saving with all edge cases."""
+    log_url = None
+    has_log_file = False
+
+    # Step 1: Try to upload actual log file
+    if log_file_path and os.path.exists(log_file_path):
+        has_log_file = True
+        file_size = os.path.getsize(log_file_path)
+        print(f"📂 Found log file: {log_file_path} ({file_size} bytes)")
+
+        if file_size > 0:
+            log_url = upload_log_file(
+                user_id=user_id,
+                run_id=run_id,
+                log_file_path=log_file_path,
+                make_public=True
+            )
+            if log_url:
+                print(f"✅ Log uploaded")
+        else:
+            print(f"⚠️ Log file is empty")
+    else:
+        print(f"⚠️ No log file available")
+
+    # Step 2: Create error log if needed
+    if not log_url and (status == "failed" or error_info):
+        error_message = result.get("error", "Unknown error")
+        traceback_str = None
+
+        if error_info:
+            error_message, traceback_str = error_info
+
+        print(f"📝 Creating error log...")
+        log_url = save_error_log_to_storage(
+            user_id=user_id,
+            run_id=run_id,
+            error_message=error_message,
+            traceback_str=traceback_str
+        )
+
+    # Step 3: Prepare metadata
+    metadata = {
+        "exit_code": result.get("exit_code"),
+        "has_assets": assets_data is not None,
+        "had_log_file": has_log_file,
+        "log_file_path": log_file_path if log_file_path else "not_generated",
+    }
+
+    if status == "failed":
+        metadata["error"] = result.get("error", "Unknown error")
+        metadata["error_type"] = "early_failure" if not has_log_file else "runtime_failure"
+
+    # Step 4: Save session
+    try:
+        save_run_session(
+            user_id=user_id,
+            user_email=user_email,
+            run_id=run_id,
+            log_url=log_url,
+            github_url=github_url,
+            tunnel_url=tunnel_url,
+            status=status,
+            additional_metadata=metadata
+        )
+        print(f"✅ Session saved")
+    except Exception as e:
+        print(f"❌ Failed to save session: {e}")
 
 
 @app.post("/runs/{run_id}")
@@ -652,8 +782,15 @@ async def start_run_byor(
     tasks: BackgroundTasks,
     github_url: str = Form(...),
     tunnel_url: str = Form(...),
-    assets: Optional[UploadFile] = File(None)
+    assets: Optional[UploadFile] = File(None),
+    user: str = Depends(get_user_from_token)
 ):
+    # Extract user information
+    user_id = user["id"]
+    user_email = user["email"]
+
+    print(f"🔐 Authenticated user: {user_id} ({user_email})")
+
     # Initialize variables
     assets_data = None
     assets_metadata = None
@@ -706,7 +843,8 @@ async def start_run_byor(
     job_data = {
         "github_url": github_url,
         "tunnel_url": tunnel_url,
-        "has_assets": assets_data is not None
+        "has_assets": assets_data is not None,
+        "user_id": user_id
     }
 
     # Save initial request to Firestore with "pending" status (no file data)
@@ -715,11 +853,12 @@ async def start_run_byor(
             run_id=run_id,
             github_url=github_url,
             tunnel_url=tunnel_url,
+            user_id=user_id,
             assets_path=None,  # No longer storing path
             assets_metadata=assets_metadata,  # Basic metadata only
             status="pending"
         )
-        print(f"💾 Saved run request to Firestore: {run_id}")
+        print(f"💾 Saved run request to Firestore: {run_id} for user {user_id}")
     except Exception as e:
         print(f"Error saving to Firestore: {e}")
 
@@ -737,6 +876,7 @@ async def start_run_byor(
         input_queues[run_id] = asyncio.Queue()
 
         print(f"🚀 Starting BYOR MAS for run {run_id}")
+        print(f"   User: {user_id} ({user_email})")
         print(f"   GitHub URL: {github_url}")
         print(f"   Tunnel URL: {tunnel_url}")
         if assets_data:
@@ -746,14 +886,19 @@ async def start_run_byor(
         input_handler = byor_bridge.create_ws_input_handler(
             run_id, input_queues[run_id])
 
-        # Wrapper to handle completion and update Firestore
         async def run_with_completion():
+            log_file_path = None
+            success = False
+            result = {}
+            error_info = None
+
             try:
+                # Run MAS
                 result = await byor_bridge.launch_mas_interactive(
                     run_id=run_id,
                     github_url=github_url,
                     tunnel_url=tunnel_url,
-                    assets_data=assets_data,  # Pass the in-memory bytes directly
+                    assets_data=assets_data,
                     job=job_data,
                     input_handler=input_handler,
                     ws_manager=ws_manager,
@@ -763,46 +908,88 @@ async def start_run_byor(
 
                 if 'pid' in result:
                     run_manager.register_process(run_id, result['pid'])
-                success = result.get("success", False)
 
-                # Update Firestore with completion status
-                try:
-                    status = "completed" if success else "failed"
-                    update_run_status_in_firestore(
-                        run_id,
-                        status,
-                        {"result": result}
-                    )
-                    print(f"✅ Updated Firestore: run {run_id} {status}")
-                except Exception as e:
-                    print(f"Error updating Firestore completion status: {e}")
+                success = result.get("success", False)
+                log_file_path = result.get("log_file")
+                exit_code = result.get("exit_code")
+
+                print(f"🏁 MAS completed for run {run_id}")
+                print(f"   Success: {success}")
+                print(f"   Exit code: {exit_code}")
+                print(
+                    f"   Log file: {log_file_path if log_file_path else '❌ Not generated'}")
+
+                # Check if log file exists
+                if log_file_path and os.path.exists(log_file_path):
+                    print(
+                        f"   Log size: {os.path.getsize(log_file_path)} bytes")
+                elif log_file_path:
+                    print(f"   ⚠️ Log file path provided but doesn't exist")
+                    log_file_path = None
+
+                status = "completed" if success else "failed"
+
+                # Update Firestore
+                update_run_status_in_firestore(
+                    run_id,
+                    status,
+                    additional_data={"result": result},
+                    create_if_missing=True
+                )
+
+                # Upload logs and save session
+                await handle_log_upload_and_session(
+                    run_id=run_id,
+                    user_id=user_id,
+                    user_email=user_email,
+                    log_file_path=log_file_path,
+                    github_url=github_url,
+                    tunnel_url=tunnel_url,
+                    status=status,
+                    result=result,
+                    assets_data=assets_data,
+                    error_info=None
+                )
 
             except Exception as e:
-                print(f"Error in run {run_id}: {e}")
-                success = False
+                print(f"❌ Exception in run {run_id}: {e}")
+                import traceback
+                traceback_str = traceback.format_exc()
+                print(traceback_str)
 
-                # Update Firestore with error status
-                try:
-                    update_run_status_in_firestore(
-                        run_id,
-                        "failed",
-                        {"error": str(e)}
-                    )
-                    print(
-                        f"❌ Updated Firestore: run {run_id} failed with error")
-                except Exception as fe:
-                    print(f"Error updating Firestore error status: {fe}")
+                success = False
+                error_message = str(e)
+                error_info = (error_message, traceback_str)
+                result = {"success": False, "error": error_message}
+
+                update_run_status_in_firestore(
+                    run_id,
+                    "failed",
+                    additional_data={"error": error_message},
+                    create_if_missing=True
+                )
+
+                await handle_log_upload_and_session(
+                    run_id=run_id,
+                    user_id=user_id,
+                    user_email=user_email,
+                    log_file_path=log_file_path,
+                    github_url=github_url,
+                    tunnel_url=tunnel_url,
+                    status="failed",
+                    result=result,
+                    assets_data=assets_data,
+                    error_info=error_info
+                )
 
             finally:
                 run_manager.unregister_process(run_id)
-                # Mark as complete in local run manager
                 await run_manager.complete_run(run_id, success)
 
-                # Clean up input queue
                 if run_id in input_queues:
                     del input_queues[run_id]
 
-                # No file cleanup needed since we're not saving files
+                print(f"🧹 Cleanup completed for run {run_id}")
 
         # Start MAS in background
         tasks.add_task(run_with_completion)
@@ -1149,6 +1336,73 @@ async def create_report_issue(
         # unexpected server error
         raise HTTPException(
             status_code=500, detail=f"Failed to create report: {e}")
+
+
+@app.get("/user/sessions")
+async def get_user_session_history(
+    limit: int = 50,
+    user: dict = Depends(get_user_from_token)
+):
+    """
+    Get session history for a user.
+    Only allows users to access their own sessions.
+    """
+
+    try:
+        sessions = get_user_sessions(user["id"], limit=limit)
+
+        return JSONResponse({
+            "user_id": user["id"],
+            "session_count": len(sessions),
+            "sessions": sessions
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving sessions: {str(e)}"
+        )
+
+
+@app.get("/user/sessions/{run_id}")
+async def get_user_session_by_run_id(
+    run_id: str,
+    user: dict = Depends(get_user_from_token)
+):
+    """
+    Get a specific session by run_id for the authenticated user.
+
+    Path:
+        run_id: The run ID to retrieve
+
+    Returns:
+        Session details if found, 404 if not found
+    """
+    user_id = user["id"]
+
+    try:
+        # Get the specific session
+        session = get_run_session(user_id, run_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found for run_id: {run_id}"
+            )
+
+        return JSONResponse({
+            "success": True,
+            "user_id": user_id,
+            "run_id": run_id,
+            "session": session
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving session: {str(e)}"
+        )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)

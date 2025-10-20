@@ -5,12 +5,15 @@ import os
 import re
 import io
 import json
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
 from .user_deployment import build_contract_assets_to_mas
+import tempfile
+
 load_dotenv()
 
 
@@ -45,6 +48,219 @@ def clean_all_tags(text):
     cleaned = re.sub(r'^[^<]*>>>', '', cleaned)
 
     return cleaned.strip()
+
+
+def detect_root_folder(members: List[str]) -> Optional[str]:
+    """
+    More robust detection of common root folder in ZIP
+    """
+    if not members:
+        return None
+
+    # Method 1: Check if all files share a common prefix directory
+    # Get all top-level items
+    top_level_items = set()
+    for member in members:
+        parts = member.split('/')
+        if parts[0]:  # Ignore empty parts
+            top_level_items.add(parts[0])
+
+    # If there's exactly one top-level item and it appears in all paths
+    if len(top_level_items) == 1:
+        potential_root = list(top_level_items)[0] + '/'
+
+        # Verify all members start with this root (except the root itself)
+        all_under_root = all(
+            m == potential_root.rstrip('/') or m.startswith(potential_root)
+            for m in members
+        )
+
+        if all_under_root:
+            return potential_root
+
+    # Method 2: Check for common path patterns (e.g., "projectname-main/")
+    # Common patterns from GitHub/GitLab archives
+    for member in members:
+        if '/' in member:
+            potential_root = member.split('/')[0] + '/'
+            # Check if this looks like an auto-generated archive root
+            # (contains version, branch name, or common suffixes)
+            if any(suffix in potential_root.lower()
+                   for suffix in ['-main', '-master', '-dev', '-v', '-release']):
+                # Verify this is actually a root
+                if all(m == potential_root.rstrip('/') or m.startswith(potential_root)
+                       for m in members):
+                    return potential_root
+
+    return None
+
+
+def verify_extracted_structure(extract_dir: Path):
+    """
+    Verify the extracted structure contains expected Foundry directories
+    """
+    expected_dirs = ['out', 'broadcast', 'src']
+    found_dirs = []
+    missing_dirs = []
+
+    for dir_name in expected_dirs:
+        dir_path = extract_dir / dir_name
+        if dir_path.exists() and dir_path.is_dir():
+            found_dirs.append(dir_name)
+            print(f"✅ Found Foundry {dir_name}/ directory")
+        else:
+            missing_dirs.append(dir_name)
+
+    if missing_dirs:
+        print(f"⚠️ Warning: Missing expected directories: {missing_dirs}")
+
+        # Debug: Show what was actually extracted
+        print("\n📂 Extracted structure:")
+        for item in extract_dir.iterdir():
+            if item.is_dir():
+                print(f"  📁 {item.name}/")
+                # Show first level of subdirectories
+                try:
+                    # Limit to 5 items
+                    for subitem in list(item.iterdir())[:5]:
+                        if subitem.is_dir():
+                            print(f"    📁 {subitem.name}/")
+                        else:
+                            print(f"    📄 {subitem.name}")
+                except:
+                    pass
+            else:
+                print(f"  📄 {item.name}")
+
+
+def extract_zip_safely(assets_data: bytes, extract_dir: Path) -> bool:
+    """
+    Safely extract ZIP file with better root folder detection and error handling
+    """
+    try:
+        # Log ZIP checksum for debugging
+        zip_hash = hashlib.md5(assets_data).hexdigest()
+        print(f"📊 ZIP MD5: {zip_hash}")
+        print(f"📦 ZIP Size: {len(assets_data)} bytes")
+
+        with zipfile.ZipFile(io.BytesIO(assets_data), 'r') as zf:
+            members = zf.namelist()
+
+            # Filter out __MACOSX files FIRST
+            filtered_members = [
+                m for m in members
+                if not m.startswith('__MACOSX/') and '/__MACOSX/' not in m
+                # Also filter ._ files
+                and not m.startswith('._') and '/._' not in m
+            ]
+
+            print(
+                f"📦 ZIP contains {len(members)} total items ({len(filtered_members)} after filtering __MACOSX)")
+
+            if not filtered_members:
+                print("⚠️ Warning: ZIP file is empty after filtering")
+                return False
+
+            # Log filtered ZIP contents for debugging
+            print(f"📦 Filtered ZIP contents (first 10 items):")
+            for member in filtered_members[:10]:
+                try:
+                    info = zf.getinfo(member)
+                    print(
+                        f"  {info.filename} - {info.file_size} bytes - {'DIR' if info.is_dir() else 'FILE'}")
+                except:
+                    print(f"  {member}")
+            if len(filtered_members) > 10:
+                print(f"  ... and {len(filtered_members) - 10} more items")
+
+            # Better root folder detection using FILTERED members
+            root_folder = detect_root_folder(filtered_members)
+
+            if root_folder:
+                print(f"📁 Detected root folder in ZIP: {root_folder}")
+            else:
+                print("📁 No common root folder detected")
+
+            extracted_count = 0
+            skipped_count = 0
+            failed_count = 0
+            macosx_skipped = len(members) - len(filtered_members)
+
+            for member in members:
+                # Skip __MACOSX files and ._ files
+                if (member.startswith('__MACOSX/') or '/__MACOSX/' in member or
+                        member.startswith('._') or '/._' in member):
+                    continue
+
+                # Skip .DS_Store files
+                if '.DS_Store' in member:
+                    skipped_count += 1
+                    continue
+
+                # Skip the root folder itself
+                if root_folder and (member == root_folder or member == root_folder.rstrip('/')):
+                    skipped_count += 1
+                    continue
+
+                # Calculate the target path
+                if root_folder and member.startswith(root_folder):
+                    # Strip the root folder from the path
+                    relative_path = member[len(root_folder):]
+                    if not relative_path:  # Empty after stripping
+                        skipped_count += 1
+                        continue
+                else:
+                    relative_path = member
+
+                # Security check: prevent directory traversal
+                if '..' in relative_path or relative_path.startswith('/'):
+                    print(f"⚠️ Skipping potentially unsafe path: {member}")
+                    skipped_count += 1
+                    continue
+
+                target_path = extract_dir / relative_path
+
+                # Handle directories
+                if member.endswith('/'):
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    extracted_count += 1
+                else:
+                    # Ensure parent directory exists
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    # Extract file
+                    try:
+                        with zf.open(member) as source:
+                            content = source.read()
+                            with open(target_path, 'wb') as target:
+                                target.write(content)
+                        extracted_count += 1
+                    except Exception as e:
+                        print(f"⚠️ Failed to extract {member}: {e}")
+                        failed_count += 1
+                        continue
+
+            print(f"✅ Extraction summary:")
+            print(f"   - Successfully extracted: {extracted_count} items")
+            print(f"   - Skipped __MACOSX: {macosx_skipped} items")
+            print(f"   - Skipped other: {skipped_count} items")
+            print(f"   - Failed: {failed_count} items")
+            print(
+                f"   - Total processed: {extracted_count + skipped_count + failed_count}/{len(filtered_members)} (excluding __MACOSX)")
+
+            # Verify expected structure
+            verify_extracted_structure(extract_dir)
+
+            return True
+
+    except zipfile.BadZipFile as e:
+        print(f"❌ Error: Invalid ZIP file - {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected error during extraction: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 class TagParser:
@@ -260,7 +476,7 @@ class PromptDetector:
             r'Enter the specific function.*:$',
             r'Enter hypothesis.*:$',
             r'Enter your detailed vulnerability hypothesis.*:$',
-            r'â–¶ï¸\s*Run another MAS\?.*:$',
+            r'Ã¢â€"Â¶Ã¯Â¸\s*Run another MAS\?.*:$',
             r'Run another MAS\?.*:$',
             r'\(y/N\):?\s*$',
         ]
@@ -662,62 +878,25 @@ async def launch_mas_interactive(
     repo_name = repo_display_name(github_url)
 
     # Use a temporary directory for extraction
-    import tempfile
-    with tempfile.TemporaryDirectory() as temp_dir:
+
+    try:
+        # Use a temporary directory that auto-deletes when the block ends
+        with tempfile.TemporaryDirectory(prefix=f"mas_extract_{run_id}_") as temp_dir:
+            print(f"Temporary directory created at: {temp_dir}")
+
         extract_dir = Path(temp_dir) / "extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
 
-        # Extract ZIP to temporary location
-        try:
-            with zipfile.ZipFile(io.BytesIO(assets_data), 'r') as zf:
-                members = zf.namelist()
-
-                # Check for common root folder
-                root_folder = None
-                if members:
-                    first = members[0]
-                    if '/' in first:
-                        potential_root = first.split('/')[0] + '/'
-                        if all(m.startswith(potential_root) or m == potential_root.rstrip('/') for m in members):
-                            root_folder = potential_root
-                            print(
-                                f"📁 Detected root folder in ZIP: {root_folder}")
-
-                # Extract files, stripping root folder if present
-                for member in members:
-                    if root_folder and (member == root_folder or member == root_folder.rstrip('/')):
-                        continue
-
-                    if root_folder and member.startswith(root_folder):
-                        relative_path = member[len(root_folder):]
-                        if not relative_path:
-                            continue
-                    else:
-                        relative_path = member
-
-                    target_path = extract_dir / relative_path
-
-                    if member.endswith('/'):
-                        target_path.mkdir(parents=True, exist_ok=True)
-                    else:
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-                        with zf.open(member) as source:
-                            with open(target_path, 'wb') as target:
-                                target.write(source.read())
-
-                print(f"✅ Temporarily extracted {len(members)} files")
-
-        except zipfile.BadZipFile:
-            print(f"❌ Error: Invalid ZIP file")
-            raise ValueError("Invalid ZIP file provided")
-
-        # Verify the structure
-        if (extract_dir / "out").exists():
-            print(f"✅ Found Foundry out/ directory")
-        if (extract_dir / "broadcast").exists():
-            print(f"✅ Found Foundry broadcast/ directory")
-        if (extract_dir / "src").exists():
-            print(f"✅ Found Foundry src/ directory")
+        # Extract ZIP with improved logic
+        if not extract_zip_safely(assets_data, extract_dir):
+            error_msg = "Failed to extract ZIP file properly"
+            print(f"ERROR: {error_msg}")
+            if ws_manager:
+                await ws_manager.send_log(run_id, {
+                    "type": "error",
+                    "data": {"error": error_msg}
+                })
+            return {"success": False, "error": error_msg}
 
         # Process and build contract assets, save to MAS deployments
         mas_deployments_dir = mas_repo / "deployments" / repo_name
@@ -730,13 +909,20 @@ async def launch_mas_interactive(
             tunnel_url=tunnel_url,
         )
 
-        print(
-            f"📍 Saved contract assets to MAS: {mas_deployments_dir}")
+        print(f"📁 Saved contract assets to MAS: {mas_deployments_dir}")
 
-    # Temp directory and extracted files are automatically deleted here
-    print(f"🗑️ Cleaned up temporary extraction directory")
+    except Exception as e:
+        print(f"❌ Error during extraction/processing: {e}")
+        import traceback
+        traceback.print_exc()
+        # Don't delete temp dir on error for debugging
+        print(f"🔍 DEBUG: Temporary directory preserved at: {temp_dir}")
+        raise
 
-    # Rest of your function...
+    # Note: NOT cleaning up temp_dir for debugging purposes
+    print(f"✅ Extraction complete. Temporary files preserved at: {temp_dir}")
+
+    # Rest of your function continues as before...
     # Prepare environment variables
     env = os.environ.copy()
     env["PYTHONPATH"] = str(mas_repo / "src")
@@ -1150,6 +1336,8 @@ async def launch_mas_interactive(
         return_code = await process.wait()
 
         print(f"\n[SHEPHERD] Process exited with code: {return_code}")
+        print(
+            f"🔍 DEBUG: Temporary extraction directory preserved at: {temp_dir}")
 
         # Send completion notification
         if ws_manager:
@@ -1165,12 +1353,15 @@ async def launch_mas_interactive(
             "exit_code": return_code,
             "log_file": str(log_file_path),
             "output": "".join(all_output),
-            "pid": process.pid
+            "pid": process.pid,
+            "debug_temp_dir": temp_dir  # Include this for debugging
         }
 
     except Exception as e:
         error_msg = f"Failed to launch MAS: {str(e)}"
         print(f"\n[SHEPHERD] ERROR: {error_msg}")
+        print(
+            f"🔍 DEBUG: Temporary extraction directory preserved at: {temp_dir}")
         import traceback
         traceback.print_exc()
 
@@ -1186,7 +1377,8 @@ async def launch_mas_interactive(
         return {
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
+            "traceback": traceback.format_exc(),
+            "debug_temp_dir": temp_dir  # Include this for debugging
         }
 
 # Helper function for creating WebSocket-based input handler
