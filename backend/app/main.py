@@ -1366,18 +1366,17 @@ async def get_user_session_history(
 @app.get("/user/sessions/{run_id}")
 async def get_user_session_by_run_id(
     run_id: str,
+    tasks: BackgroundTasks,
     user: dict = Depends(get_user_from_token)
 ):
     """
-    Get a specific session by run_id for the authenticated user.
-
-    Path:
-        run_id: The run ID to retrieve
-
-    Returns:
-        Session details if found, 404 if not found
+    Get a specific session by run_id and trigger log replay if it's a completed run.
     """
     user_id = user["id"]
+    user_email = user.get("email", "")
+
+    # Create composite WebSocket ID
+    ws_id = f"{user_id}_{run_id}"
 
     try:
         # Get the specific session
@@ -1389,12 +1388,85 @@ async def get_user_session_by_run_id(
                 detail=f"Session not found for run_id: {run_id}"
             )
 
-        return JSONResponse({
-            "success": True,
-            "user_id": user_id,
-            "run_id": run_id,
-            "session": session
-        })
+        # Check if this is a completed/failed run
+        if session.get('status') in ['completed', 'failed']:
+            print(f"🚀 Starting historical replay for run {run_id}")
+            print(f"   User: {user_id} ({user_email})")
+            print(f"   WebSocket ID: {ws_id}")
+            print(f"   Original status: {session.get('status')}")
+
+            async def run_replay():
+                import time
+                replay_start = time.time()
+
+                try:
+                    # Wait a moment for WebSocket to connect
+                    await asyncio.sleep(0.5)
+
+                    # Check if WebSocket is connected using composite ID
+                    if not ws_manager or ws_id not in ws_manager._conns or not ws_manager._conns[ws_id]:
+                        print(
+                            f"⚠️ No WebSocket connection for {ws_id}, skipping replay")
+                        return
+
+                    # Run the replay using the clean function
+                    result = await byor_bridge.replay_mas_historical(
+                        run_id=run_id,
+                        user_id=user_id,
+                        session_data=session,
+                        ws_manager=ws_manager
+                    )
+
+                    replay_time = time.time() - replay_start
+
+                    if result.get("success"):
+                        print(
+                            f"🏁 Replay completed for run {run_id} in {replay_time:.2f}s")
+                        print(
+                            f"   Events processed: {result.get('events_processed')}")
+                        print(f"   Log size: {result.get('log_size')} bytes")
+                        if 'timing' in result:
+                            print(
+                                f"   Download: {result['timing']['download_seconds']:.2f}s")
+                            print(
+                                f"   Processing: {result['timing']['processing_seconds']:.2f}s")
+                    else:
+                        print(
+                            f"❌ Replay failed for run {run_id} after {replay_time:.2f}s")
+                        print(f"   Error: {result.get('error')}")
+
+                except Exception as e:
+                    elapsed = time.time() - replay_start
+                    print(
+                        f"❌ Exception during replay {run_id} after {elapsed:.2f}s: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    print(f"🧹 Replay cleanup completed for run {run_id}")
+
+            # Start replay in background
+            tasks.add_task(run_replay)
+
+            return JSONResponse({
+                "success": True,
+                "user_id": user_id,
+                "run_id": run_id,
+                "ws_id": ws_id,  # Include the WebSocket ID for frontend
+                "session": session,
+                "replay_triggered": True,
+                "message": f"Connect to WebSocket at /ws/{ws_id} to receive replay"
+            })
+
+        else:
+            # For live/pending runs, just return session
+            return JSONResponse({
+                "success": True,
+                "user_id": user_id,
+                "run_id": run_id,
+                "ws_id": ws_id,
+                "session": session,
+                "replay_triggered": False
+            })
 
     except HTTPException:
         raise

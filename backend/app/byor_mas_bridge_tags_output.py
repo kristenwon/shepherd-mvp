@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
+from .firebase_storage import get_storage_bucket
 from .user_deployment import build_contract_assets_to_mas
 import tempfile
 
@@ -1396,3 +1397,194 @@ def create_ws_input_handler(run_id: str, input_queue: asyncio.Queue):
         return user_input
 
     return handler
+
+
+async def replay_mas_historical(
+    run_id: str,
+    user_id: str,
+    session_data: dict,
+    ws_manager=None,
+) -> Dict[str, Any]:
+    """
+    Replay a historical MAS log file through WebSocket by parsing it with TagAwareOutputBuffer.
+    """
+    import time
+    start_time = time.time()
+
+    # Use composite ID format for WebSocket
+    ws_id = f"{user_id}_{run_id}"
+
+    try:
+        print(f"[REPLAY] Starting replay for run {run_id}")
+        print(f"[REPLAY] User: {user_id}")
+        print(f"[REPLAY] WebSocket ID: {ws_id}")
+
+        # Get the bucket instance
+        bucket = get_storage_bucket()
+
+        # Construct the blob path
+        blob_path = f"run-logs/{user_id}/{run_id}.log"
+
+        print(f"[REPLAY] Fetching from: {blob_path}")
+
+        # Time the download
+        download_start = time.time()
+
+        # Get the blob
+        blob = bucket.blob(blob_path)
+
+        if not blob.exists():
+            error_msg = f"Log file not found: {blob_path}"
+            print(f"[REPLAY] ERROR: {error_msg}")
+            if ws_manager:
+                await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                    "type": "error",
+                    "data": {"error": error_msg}
+                })
+            return {"success": False, "error": error_msg}
+
+        # Download log content to memory
+        log_content = blob.download_as_text()
+
+        download_time = time.time() - download_start
+        print(
+            f"[REPLAY] Downloaded {len(log_content)} characters from Firebase in {download_time:.2f}s")
+
+        # Send start notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "start",
+                "data": {
+                    "mode": "replay",
+                    "source": "firebase",
+                    "log_size": len(log_content),
+                    "download_time_seconds": download_time
+                }
+            })
+
+        # Initialize output buffer with tag support
+        # Update TagAwareOutputBuffer to use ws_id instead of run_id for sending
+        output_buffer = TagAwareOutputBuffer(
+            ws_manager=ws_manager,
+            run_id=ws_id,  # Pass ws_id as run_id so it sends to correct WebSocket
+            github_url=session_data.get('github_url'),
+            tunnel_url=session_data.get('tunnel_url')
+        )
+
+        # Send replay started notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "process_started",
+                "data": {
+                    "mode": "replay",
+                    "original_status": session_data.get('status'),
+                    "log_path": blob_path
+                }
+            })
+
+        print(f"[REPLAY] Processing log through TagAwareOutputBuffer...")
+        print("-" * 80)
+
+        # Time the processing
+        processing_start = time.time()
+
+        # Process the log character by character (instant, no delays)
+        total_chars = len(log_content)
+        last_progress = 0
+        chars_processed = 0
+
+        for i, char in enumerate(log_content):
+            await output_buffer.add_char(char)
+            chars_processed += 1
+
+            # Send progress updates for large files
+            if total_chars > 50000:  # Only for files > 50KB
+                progress = int((i / total_chars) * 100)
+                if progress >= last_progress + 10:
+                    last_progress = progress
+                    elapsed = time.time() - processing_start
+                    rate = chars_processed / elapsed if elapsed > 0 else 0
+
+                    if ws_manager:
+                        await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                            "type": "replay_progress",
+                            "data": {
+                                "progress": progress,
+                                "chars_processed": chars_processed,
+                                "elapsed_seconds": elapsed,
+                                "chars_per_second": rate
+                            }
+                        })
+
+                    print(
+                        f"[REPLAY] Progress: {progress}% ({chars_processed}/{total_chars} chars) - {rate:.0f} chars/sec")
+
+        # Flush any remaining content
+        await output_buffer.flush()
+
+        processing_time = time.time() - processing_start
+        total_time = time.time() - start_time
+
+        print(f"\n[REPLAY] Processing complete")
+        print(
+            f"[REPLAY] Total events processed: {output_buffer.stream_counter}")
+        print(f"[REPLAY] Processing time: {processing_time:.2f}s")
+        print(
+            f"[REPLAY] Processing rate: {total_chars/processing_time:.0f} chars/sec")
+        print(f"[REPLAY] Total replay time: {total_time:.2f}s")
+
+        # Send completion notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "complete",
+                "data": {
+                    "mode": "replay",
+                    "success": True,
+                    "total_events": output_buffer.stream_counter,
+                    "original_status": session_data.get('status'),
+                    "exit_code": session_data.get('metadata', {}).get('exit_code', 0),
+                    "timing": {
+                        "download_seconds": download_time,
+                        "processing_seconds": processing_time,
+                        "total_seconds": total_time,
+                        "chars_per_second": total_chars / processing_time if processing_time > 0 else 0
+                    }
+                }
+            })
+
+        return {
+            "success": True,
+            "mode": "replay",
+            "events_processed": output_buffer.stream_counter,
+            "log_size": len(log_content),
+            "timing": {
+                "download_seconds": download_time,
+                "processing_seconds": processing_time,
+                "total_seconds": total_time
+            }
+        }
+
+    except Exception as e:
+        error_msg = f"Failed to replay MAS log: {str(e)}"
+        elapsed = time.time() - start_time
+        print(f"\n[REPLAY] ERROR after {elapsed:.2f}s: {error_msg}")
+        import traceback
+        traceback.print_exc()
+
+        # Send error notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "error",
+                "data": {
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "elapsed_seconds": elapsed
+                }
+            })
+
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "elapsed_seconds": elapsed
+        }
