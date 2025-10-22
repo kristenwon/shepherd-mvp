@@ -27,6 +27,7 @@ from . import dvd8_mas_bridge_tags_output as dvd8_bridge
 from . import byor_mas_bridge_tags_output as byor_bridge
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
 from .models.waitlist import WaitlistRequest
+from .models.update_session_name_request import UpdateSessionNameRequest
 from dotenv import load_dotenv
 import json
 from datetime import datetime
@@ -35,7 +36,7 @@ from typing import Optional
 import zipfile
 import io
 from .utils import save_run_request_to_firestore, update_run_status_in_firestore
-from .firebase_storage import init_firebase, ReportIssueService, upload_log_file, save_run_session, get_user_sessions, save_error_log_to_storage, get_run_session
+from .firebase_storage import init_firebase, ReportIssueService, upload_log_file, save_run_session, get_user_sessions, save_error_log_to_storage, get_run_session, update_session_name
 from fastapi import Depends, Header, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
@@ -702,6 +703,7 @@ async def handle_log_upload_and_session(
     log_file_path: Optional[str],
     github_url: str,
     tunnel_url: str,
+    session_name: str,
     status: str,
     result: dict,
     assets_data: Optional[bytes],
@@ -768,6 +770,7 @@ async def handle_log_upload_and_session(
             log_url=log_url,
             github_url=github_url,
             tunnel_url=tunnel_url,
+            session_name=session_name,
             status=status,
             additional_metadata=metadata
         )
@@ -782,6 +785,7 @@ async def start_run_byor(
     tasks: BackgroundTasks,
     github_url: str = Form(...),
     tunnel_url: str = Form(...),
+    session_name: str = Form(...),
     assets: Optional[UploadFile] = File(None),
     user: str = Depends(get_user_from_token)
 ):
@@ -843,6 +847,7 @@ async def start_run_byor(
     job_data = {
         "github_url": github_url,
         "tunnel_url": tunnel_url,
+        "session_name": session_name,
         "has_assets": assets_data is not None,
         "user_id": user_id
     }
@@ -945,6 +950,7 @@ async def start_run_byor(
                     log_file_path=log_file_path,
                     github_url=github_url,
                     tunnel_url=tunnel_url,
+                    session_name=session_name,
                     status=status,
                     result=result,
                     assets_data=assets_data,
@@ -1475,6 +1481,73 @@ async def get_user_session_by_run_id(
             status_code=500,
             detail=f"Error retrieving session: {str(e)}"
         )
+
+
+@app.patch("/user/sessions/{run_id}/name")
+async def update_session_name_endpoint(
+    run_id: str,
+    request: UpdateSessionNameRequest,
+    user: dict = Depends(get_user_from_token)
+):
+    """
+    Update the session name for a specific run.
+    Users can only update their own sessions.
+
+    Args:
+        run_id: The run ID of the session to update
+        request: Request body containing the new session_name
+        user: User info from JWT token
+
+    Returns:
+        JSON response with success status and updated session info
+    """
+    user_id = user["id"]
+
+    try:
+        # Validate session name
+        if not request.session_name or not request.session_name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Session name cannot be empty"
+            )
+
+        # Verify the session exists and belongs to the user
+        session = get_run_session(user_id, run_id)
+        if not session:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found for run_id: {run_id}"
+            )
+
+        # Update the session name
+        success = update_session_name(
+            user_id, run_id, request.session_name.strip())
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to update session name"
+            )
+
+        # Get the updated session
+        updated_session = get_run_session(user_id, run_id)
+
+        return JSONResponse({
+            "success": True,
+            "message": "Session name updated successfully",
+            "run_id": run_id,
+            "session_name": request.session_name.strip(),
+            "session": updated_session
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error updating session name: {str(e)}"
+        )
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)

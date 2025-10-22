@@ -347,6 +347,7 @@ def save_run_session(
     log_url: Optional[str] = None,
     github_url: Optional[str] = None,
     tunnel_url: Optional[str] = None,
+    session_name: Optional[str] = None,
     status: str = "completed",
     additional_metadata: Optional[Dict[str, Any]] = None
 ) -> None:
@@ -395,6 +396,7 @@ def save_run_session(
         if additional_metadata:
             session_data["metadata"] = additional_metadata
 
+        session_data["session_name"] = session_name
         # Save to run-sessions collection with composite ID
         composite_id = f"{user_id}_{run_id}"
         run_sessions_ref = db.collection("run-sessions").document(composite_id)
@@ -584,3 +586,53 @@ Note: This run failed before a complete log file could be generated.
     except Exception as e:
         print(f"❌ Failed to save error log: {e}")
         return None
+
+
+def update_session_name(
+    user_id: str,
+    run_id: str,
+    session_name: str
+) -> bool:
+    """
+    Update the session_name for a run session in both collections.
+
+    Args:
+        user_id: User ID
+        run_id: Run ID
+        session_name: New session name
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        db = get_firestore_client()
+
+        update_data = {
+            "session_name": session_name,
+            "updated_at": firestore.SERVER_TIMESTAMP
+        }
+
+        # Update in run-sessions collection
+        composite_id = f"{user_id}_{run_id}"
+        run_sessions_ref = db.collection("run-sessions").document(composite_id)
+
+        # Check if document exists
+        if not run_sessions_ref.get().exists:
+            print(f"❌ Session not found: {composite_id}")
+            return False
+
+        run_sessions_ref.update(update_data)
+
+        # Update in user-sessions subcollection
+        user_session_ref = db.collection("user-sessions").document(
+            user_id).collection("sessions").document(run_id)
+        user_session_ref.update(update_data)
+
+        print(f"✅ Updated session name for {composite_id} to: {session_name}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to update session name: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
