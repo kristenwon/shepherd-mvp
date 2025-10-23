@@ -1347,19 +1347,27 @@ async def create_report_issue(
 @app.get("/user/sessions")
 async def get_user_session_history(
     limit: int = 50,
+    offset: int = 0,
     user: dict = Depends(get_user_from_token)
 ):
     """
     Get session history for a user.
     Only allows users to access their own sessions.
+
+    Args:
+        limit: Maximum number of sessions to return (default: 50)
+        offset: Number of sessions to skip (default: 0)
+        user: Authenticated user from token
     """
 
     try:
-        sessions = get_user_sessions(user["id"], limit=limit)
+        sessions = get_user_sessions(user["id"], limit=limit, offset=offset)
 
         return JSONResponse({
             "user_id": user["id"],
             "session_count": len(sessions),
+            "limit": limit,
+            "offset": offset,
             "sessions": sessions
         })
     except Exception as e:

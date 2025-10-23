@@ -415,13 +415,14 @@ def save_run_session(
         traceback.print_exc()
 
 
-def get_user_sessions(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+def get_user_sessions(user_id: str, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """
     Retrieve all sessions for a specific user.
 
     Args:
         user_id: User ID
         limit: Maximum number of sessions to return
+        offset: Number of sessions to skip for pagination
 
     Returns:
         List of session dictionaries
@@ -431,8 +432,17 @@ def get_user_sessions(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
 
     sessions_ref = db.collection("user-sessions").document(
         user_id).collection("sessions")
-    sessions = sessions_ref.order_by(
-        "timestamp", direction=firestore.Query.DESCENDING).limit(limit).stream()
+
+    # Build query with ordering
+    sessions_query = sessions_ref.order_by(
+        "timestamp", direction=firestore.Query.DESCENDING)
+
+    # Apply offset if provided
+    if offset > 0:
+        sessions_query = sessions_query.offset(offset)
+
+    # Apply limit and execute query
+    sessions = sessions_query.limit(limit).stream()
 
     result = []
     for session in sessions:
