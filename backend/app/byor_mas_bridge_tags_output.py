@@ -11,10 +11,11 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
-from .firebase_storage import get_storage_bucket
+from .firebase_storage import get_storage_bucket, get_firestore_client, save_run_session, upload_log_file
 from .user_deployment import build_contract_assets_to_mas
 import tempfile
-
+import time
+from firebase_admin import credentials, firestore, storage
 load_dotenv()
 
 
@@ -857,6 +858,8 @@ async def launch_mas_interactive(
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
+    last_save_time = time.time()
+    SAVE_INTERVAL = 30
     # Create timestamp for log files
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
@@ -1013,6 +1016,10 @@ async def launch_mas_interactive(
                     no_output_count = 0
                 except asyncio.TimeoutError:
                     no_output_count += 1
+
+                    if time.time() - last_save_time >= SAVE_INTERVAL:
+                        await save_partial_logs_to_firestore(run_id, str(log_file_path), all_output, job)
+                        last_save_time = time.time()
 
                     current_time = asyncio.get_event_loop().time()
                     time_since_last = current_time - last_char_time
@@ -1588,3 +1595,116 @@ async def replay_mas_historical(
             "traceback": traceback.format_exc(),
             "elapsed_seconds": elapsed
         }
+
+
+async def save_partial_logs_to_firestore(
+    run_id: str,
+    log_file_path: str,
+    all_output: list,
+    job: dict  # Add job parameter to get user_id and other info
+):
+    """
+    Periodically save logs to Firebase Storage and update existing session/run documents.
+    Matches the structure of handle_log_upload_and_session.
+    """
+    try:
+        # Extract needed info from job
+        user_id = job.get('user_id', 'unknown')
+        github_url = job.get('github_url', '')
+        tunnel_url = job.get('tunnel_url', '')
+        session_name = job.get('session_name', run_id)
+
+        # Step 1: Prepare log content
+        if os.path.exists(log_file_path):
+            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                log_content = f.read()
+            file_size = len(log_content)
+            print(
+                f"📂 [PERIODIC] Found log file: {log_file_path} ({file_size} bytes)")
+        else:
+            log_content = ''.join(all_output)
+            file_size = len(log_content)
+            print(f"📝 [PERIODIC] Using memory buffer ({file_size} bytes)")
+
+        if file_size == 0:
+            print(f"⚠️ [PERIODIC] No log content to save")
+            return False
+
+        # Step 2: Upload to Firebase Storage (same as handle_log_upload_and_session)
+        log_url = None
+        try:
+            # Option A: Use your existing upload_log_file function
+            if os.path.exists(log_file_path):
+                log_url = upload_log_file(
+                    user_id=user_id,
+                    run_id=run_id,
+                    log_file_path=log_file_path,
+                    make_public=True
+                )
+            else:
+                # Option B: Direct upload from memory
+                bucket = get_storage_bucket()
+                blob_name = f"run-logs/{user_id}/{run_id}.log"
+                blob = bucket.blob(blob_name)
+                blob.upload_from_string(log_content)
+                blob.make_public()
+                log_url = blob.public_url
+
+            if log_url:
+                print(f"✅ [PERIODIC] Log uploaded to storage")
+        except Exception as e:
+            print(f"⚠️ [PERIODIC] Failed to upload to storage: {e}")
+
+        # Step 3: Prepare metadata (similar to handle_log_upload_and_session)
+        metadata = {
+            "last_update": datetime.now().isoformat(),
+            "log_size": file_size,
+            "is_partial": True,
+            "log_url": log_url,
+            "status": "running",
+            "partial_log_saved": True
+        }
+
+        # Step 4: Update existing documents (not create new ones)
+        db = get_firestore_client()
+
+        # Update or create session (using save_run_session if you have it)
+        try:
+            # Option A: Use your existing save_run_session function
+            save_run_session(
+                user_id=user_id,
+                user_email=job.get('user_email', ''),
+                run_id=run_id,
+                log_url=log_url,
+                github_url=github_url,
+                tunnel_url=tunnel_url,
+                session_name=session_name,
+                status="running",
+                additional_metadata=metadata,
+            )
+            print(f"✅ [PERIODIC] Session updated")
+        except:
+            # Option B: Direct update if save_run_session is not available
+            session_ref = db.collection(
+                "sessions").document(f"{user_id}_{run_id}")
+            session_ref.set({
+                "user_id": user_id,
+                "run_id": run_id,
+                "log_url": log_url,
+                "github_url": github_url,
+                "tunnel_url": tunnel_url,
+                "session_name": session_name,
+                "status": "running",
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                **metadata
+            }, merge=True)  # merge=True to update existing
+            print(f"✅ [PERIODIC] Session document updated")
+
+        print(f"✅ [PERIODIC] Saved logs for {run_id} ({file_size} bytes)")
+        return True
+
+    except Exception as e:
+        print(f"❌ [PERIODIC] Failed to save: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

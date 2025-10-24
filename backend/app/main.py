@@ -713,70 +713,76 @@ async def handle_log_upload_and_session(
     log_url = None
     has_log_file = False
 
-    # Step 1: Try to upload actual log file
-    if log_file_path and os.path.exists(log_file_path):
+    if result.get("log_already_uploaded"):
+        print("✅ Logs already uploaded (skipping duplicate)")
         has_log_file = True
-        file_size = os.path.getsize(log_file_path)
-        print(f"📂 Found log file: {log_file_path} ({file_size} bytes)")
+        # Construct the URL if you need it
+        log_url = f"https://storage.googleapis.com/your-bucket/run-logs/{user_id}/{run_id}.log"
+    else:
+        if log_file_path and os.path.exists(log_file_path):
+            has_log_file = True
+            file_size = os.path.getsize(log_file_path)
+            print(f"📂 Found log file: {log_file_path} ({file_size} bytes)")
 
-        if file_size > 0:
-            log_url = upload_log_file(
+            if file_size > 0:
+                log_url = upload_log_file(
+                    user_id=user_id,
+                    run_id=run_id,
+                    log_file_path=log_file_path,
+                    make_public=True
+                )
+                if log_url:
+                    print(f"✅ Log uploaded")
+            else:
+                print(f"⚠️ Log file is empty")
+        else:
+            print(f"⚠️ No log file available")
+
+        # Step 2: Create error log if needed
+        if not log_url and (status == "failed" or error_info):
+            error_message = result.get("error", "Unknown error")
+            traceback_str = None
+
+            if error_info:
+                error_message, traceback_str = error_info
+
+            print(f"📝 Creating error log...")
+            log_url = save_error_log_to_storage(
                 user_id=user_id,
                 run_id=run_id,
-                log_file_path=log_file_path,
-                make_public=True
+                error_message=error_message,
+                traceback_str=traceback_str
             )
-            if log_url:
-                print(f"✅ Log uploaded")
-        else:
-            print(f"⚠️ Log file is empty")
-    else:
-        print(f"⚠️ No log file available")
 
-    # Step 2: Create error log if needed
-    if not log_url and (status == "failed" or error_info):
-        error_message = result.get("error", "Unknown error")
-        traceback_str = None
+        # Step 3: Prepare metadata
+        metadata = {
+            "exit_code": result.get("exit_code"),
+            "has_assets": assets_data is not None,
+            "had_log_file": has_log_file,
+            "log_file_path": log_file_path if log_file_path else "not_generated",
+            "partial_log_saved": False
+        }
 
-        if error_info:
-            error_message, traceback_str = error_info
+        if status == "failed":
+            metadata["error"] = result.get("error", "Unknown error")
+            metadata["error_type"] = "early_failure" if not has_log_file else "runtime_failure"
 
-        print(f"📝 Creating error log...")
-        log_url = save_error_log_to_storage(
-            user_id=user_id,
-            run_id=run_id,
-            error_message=error_message,
-            traceback_str=traceback_str
-        )
-
-    # Step 3: Prepare metadata
-    metadata = {
-        "exit_code": result.get("exit_code"),
-        "has_assets": assets_data is not None,
-        "had_log_file": has_log_file,
-        "log_file_path": log_file_path if log_file_path else "not_generated",
-    }
-
-    if status == "failed":
-        metadata["error"] = result.get("error", "Unknown error")
-        metadata["error_type"] = "early_failure" if not has_log_file else "runtime_failure"
-
-    # Step 4: Save session
-    try:
-        save_run_session(
-            user_id=user_id,
-            user_email=user_email,
-            run_id=run_id,
-            log_url=log_url,
-            github_url=github_url,
-            tunnel_url=tunnel_url,
-            session_name=session_name,
-            status=status,
-            additional_metadata=metadata
-        )
-        print(f"✅ Session saved")
-    except Exception as e:
-        print(f"❌ Failed to save session: {e}")
+        # Step 4: Save session
+        try:
+            save_run_session(
+                user_id=user_id,
+                user_email=user_email,
+                run_id=run_id,
+                log_url=log_url,
+                github_url=github_url,
+                tunnel_url=tunnel_url,
+                session_name=session_name,
+                status=status,
+                additional_metadata=metadata
+            )
+            print(f"✅ Session saved")
+        except Exception as e:
+            print(f"❌ Failed to save session: {e}")
 
 
 @app.post("/runs/{run_id}")
