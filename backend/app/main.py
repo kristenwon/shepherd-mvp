@@ -6,9 +6,10 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, status
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
+import traceback
 from typing import Dict, Optional, List, Tuple
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import os
 import time
@@ -26,6 +27,7 @@ from . import dvd8_mas_bridge_tags_output as dvd8_bridge
 from . import byor_mas_bridge_tags_output as byor_bridge
 from .models.db import create_repository_analysis, get_repository_analysis, update_analysis_status, list_user_analyses, delete_repository_analysis
 from .models.waitlist import WaitlistRequest
+from .models.update_session_name_request import UpdateSessionNameRequest
 from dotenv import load_dotenv
 import json
 from datetime import datetime
@@ -34,7 +36,11 @@ from typing import Optional
 import zipfile
 import io
 from .utils import save_run_request_to_firestore, update_run_status_in_firestore
-from .firebase_storage import init_firebase, ReportIssueService
+from .firebase_storage import init_firebase, ReportIssueService, upload_log_file, save_run_session, get_user_sessions, save_error_log_to_storage, get_run_session, update_session_name
+from fastapi import Depends, Header, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+
 load_dotenv()
 
 
@@ -146,7 +152,7 @@ class RunManager:
                 self.active_runs[run_id] = {
                     "run_id": run_id,
                     "status": RunStatus.RUNNING,
-                    "started_at": datetime.utcnow().isoformat(),
+                    "started_at": datetime.now(timezone.utc).isoformat(),
                     "job_data": job_data
                 }
                 return {"status": "started", "run_id": run_id}
@@ -641,9 +647,142 @@ async def start_run(challenge_name: str, run_id: str, job: JobRequest, tasks: Ba
         raise HTTPException(
             status_code=500, detail="Unexpected status from run manager")
 
-# Add these imports at the top of your main.py
+security = HTTPBearer()
 
-# Complete endpoint with Firestore integration
+
+async def get_user_from_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> dict:
+    """
+    Extract and validate JWT token, return user data including ID and email.
+
+    Returns:
+        dict with 'id', 'email', 'sub', etc.
+    """
+    try:
+        token = credentials.credentials
+
+        # Decode the JWT token
+        # If you need to verify signature, provide your secret key:
+        # payload = jwt.decode(token, YOUR_SECRET_KEY, algorithms=["HS256"])
+
+        # For now, decode without verification (if you trust the source)
+        payload = jwt.decode(token, options={"verify_signature": False})
+
+        # Extract user information
+        user_id = payload.get("id")
+        user_email = payload.get("email")
+        user_sub = payload.get("sub")
+
+        if not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid token: missing user ID"
+            )
+
+        return {
+            "id": user_id,
+            "email": user_email,
+            "sub": user_sub,
+            "full_payload": payload
+        }
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(
+            status_code=401, detail=f"Authentication error: {str(e)}")
+
+
+async def handle_log_upload_and_session(
+    run_id: str,
+    user_id: str,
+    user_email: str,
+    log_file_path: Optional[str],
+    github_url: str,
+    tunnel_url: str,
+    session_name: str,
+    status: str,
+    result: dict,
+    assets_data: Optional[bytes],
+    error_info: Optional[tuple] = None
+):
+    """Handle log upload and session saving with all edge cases."""
+    log_url = None
+    has_log_file = False
+
+    if result.get("log_already_uploaded"):
+        print("✅ Logs already uploaded (skipping duplicate)")
+        has_log_file = True
+        # Construct the URL if you need it
+        log_url = f"https://storage.googleapis.com/your-bucket/run-logs/{user_id}/{run_id}.log"
+    else:
+        if log_file_path and os.path.exists(log_file_path):
+            has_log_file = True
+            file_size = os.path.getsize(log_file_path)
+            print(f"📂 Found log file: {log_file_path} ({file_size} bytes)")
+
+            if file_size > 0:
+                log_url = upload_log_file(
+                    user_id=user_id,
+                    run_id=run_id,
+                    log_file_path=log_file_path,
+                    make_public=True
+                )
+                if log_url:
+                    print(f"✅ Log uploaded")
+            else:
+                print(f"⚠️ Log file is empty")
+        else:
+            print(f"⚠️ No log file available")
+
+        # Step 2: Create error log if needed
+        if not log_url and (status == "failed" or error_info):
+            error_message = result.get("error", "Unknown error")
+            traceback_str = None
+
+            if error_info:
+                error_message, traceback_str = error_info
+
+            print(f"📝 Creating error log...")
+            log_url = save_error_log_to_storage(
+                user_id=user_id,
+                run_id=run_id,
+                error_message=error_message,
+                traceback_str=traceback_str
+            )
+
+        # Step 3: Prepare metadata
+        metadata = {
+            "exit_code": result.get("exit_code"),
+            "has_assets": assets_data is not None,
+            "had_log_file": has_log_file,
+            "log_file_path": log_file_path if log_file_path else "not_generated",
+            "partial_log_saved": False
+        }
+
+        if status == "failed":
+            metadata["error"] = result.get("error", "Unknown error")
+            metadata["error_type"] = "early_failure" if not has_log_file else "runtime_failure"
+
+        # Step 4: Save session
+        try:
+            save_run_session(
+                user_id=user_id,
+                user_email=user_email,
+                run_id=run_id,
+                log_url=log_url,
+                github_url=github_url,
+                tunnel_url=tunnel_url,
+                session_name=session_name,
+                status=status,
+                additional_metadata=metadata
+            )
+            print(f"✅ Session saved")
+        except Exception as e:
+            print(f"❌ Failed to save session: {e}")
 
 
 @app.post("/runs/{run_id}")
@@ -652,8 +791,16 @@ async def start_run_byor(
     tasks: BackgroundTasks,
     github_url: str = Form(...),
     tunnel_url: str = Form(...),
-    assets: Optional[UploadFile] = File(None)
+    session_name: str = Form(...),
+    assets: Optional[UploadFile] = File(None),
+    user: str = Depends(get_user_from_token)
 ):
+    # Extract user information
+    user_id = user["id"]
+    user_email = user["email"]
+
+    print(f"🔐 Authenticated user: {user_id} ({user_email})")
+
     # Initialize variables
     assets_data = None
     assets_metadata = None
@@ -706,7 +853,9 @@ async def start_run_byor(
     job_data = {
         "github_url": github_url,
         "tunnel_url": tunnel_url,
-        "has_assets": assets_data is not None
+        "session_name": session_name,
+        "has_assets": assets_data is not None,
+        "user_id": user_id
     }
 
     # Save initial request to Firestore with "pending" status (no file data)
@@ -715,11 +864,12 @@ async def start_run_byor(
             run_id=run_id,
             github_url=github_url,
             tunnel_url=tunnel_url,
+            user_id=user_id,
             assets_path=None,  # No longer storing path
             assets_metadata=assets_metadata,  # Basic metadata only
             status="pending"
         )
-        print(f"💾 Saved run request to Firestore: {run_id}")
+        print(f"💾 Saved run request to Firestore: {run_id} for user {user_id}")
     except Exception as e:
         print(f"Error saving to Firestore: {e}")
 
@@ -737,6 +887,7 @@ async def start_run_byor(
         input_queues[run_id] = asyncio.Queue()
 
         print(f"🚀 Starting BYOR MAS for run {run_id}")
+        print(f"   User: {user_id} ({user_email})")
         print(f"   GitHub URL: {github_url}")
         print(f"   Tunnel URL: {tunnel_url}")
         if assets_data:
@@ -746,14 +897,19 @@ async def start_run_byor(
         input_handler = byor_bridge.create_ws_input_handler(
             run_id, input_queues[run_id])
 
-        # Wrapper to handle completion and update Firestore
         async def run_with_completion():
+            log_file_path = None
+            success = False
+            result = {}
+            error_info = None
+
             try:
+                # Run MAS
                 result = await byor_bridge.launch_mas_interactive(
                     run_id=run_id,
                     github_url=github_url,
                     tunnel_url=tunnel_url,
-                    assets_data=assets_data,  # Pass the in-memory bytes directly
+                    assets_data=assets_data,
                     job=job_data,
                     input_handler=input_handler,
                     ws_manager=ws_manager,
@@ -763,46 +919,89 @@ async def start_run_byor(
 
                 if 'pid' in result:
                     run_manager.register_process(run_id, result['pid'])
-                success = result.get("success", False)
 
-                # Update Firestore with completion status
-                try:
-                    status = "completed" if success else "failed"
-                    update_run_status_in_firestore(
-                        run_id,
-                        status,
-                        {"result": result}
-                    )
-                    print(f"✅ Updated Firestore: run {run_id} {status}")
-                except Exception as e:
-                    print(f"Error updating Firestore completion status: {e}")
+                success = result.get("success", False)
+                log_file_path = result.get("log_file")
+                exit_code = result.get("exit_code")
+
+                print(f"🏁 MAS completed for run {run_id}")
+                print(f"   Success: {success}")
+                print(f"   Exit code: {exit_code}")
+                print(
+                    f"   Log file: {log_file_path if log_file_path else '❌ Not generated'}")
+
+                # Check if log file exists
+                if log_file_path and os.path.exists(log_file_path):
+                    print(
+                        f"   Log size: {os.path.getsize(log_file_path)} bytes")
+                elif log_file_path:
+                    print(f"   ⚠️ Log file path provided but doesn't exist")
+                    log_file_path = None
+
+                status = "completed" if success else "failed"
+
+                # Update Firestore
+                update_run_status_in_firestore(
+                    run_id,
+                    status,
+                    additional_data={"result": result},
+                    create_if_missing=True
+                )
+
+                # Upload logs and save session
+                await handle_log_upload_and_session(
+                    run_id=run_id,
+                    user_id=user_id,
+                    user_email=user_email,
+                    log_file_path=log_file_path,
+                    github_url=github_url,
+                    tunnel_url=tunnel_url,
+                    session_name=session_name,
+                    status=status,
+                    result=result,
+                    assets_data=assets_data,
+                    error_info=None
+                )
 
             except Exception as e:
-                print(f"Error in run {run_id}: {e}")
-                success = False
+                print(f"❌ Exception in run {run_id}: {e}")
+                import traceback
+                traceback_str = traceback.format_exc()
+                print(traceback_str)
 
-                # Update Firestore with error status
-                try:
-                    update_run_status_in_firestore(
-                        run_id,
-                        "failed",
-                        {"error": str(e)}
-                    )
-                    print(
-                        f"❌ Updated Firestore: run {run_id} failed with error")
-                except Exception as fe:
-                    print(f"Error updating Firestore error status: {fe}")
+                success = False
+                error_message = str(e)
+                error_info = (error_message, traceback_str)
+                result = {"success": False, "error": error_message}
+
+                update_run_status_in_firestore(
+                    run_id,
+                    "failed",
+                    additional_data={"error": error_message},
+                    create_if_missing=True
+                )
+
+                await handle_log_upload_and_session(
+                    run_id=run_id,
+                    user_id=user_id,
+                    user_email=user_email,
+                    log_file_path=log_file_path,
+                    github_url=github_url,
+                    tunnel_url=tunnel_url,
+                    status="failed",
+                    result=result,
+                    assets_data=assets_data,
+                    error_info=error_info
+                )
 
             finally:
                 run_manager.unregister_process(run_id)
-                # Mark as complete in local run manager
                 await run_manager.complete_run(run_id, success)
 
-                # Clean up input queue
                 if run_id in input_queues:
                     del input_queues[run_id]
 
-                # No file cleanup needed since we're not saving files
+                print(f"🧹 Cleanup completed for run {run_id}")
 
         # Start MAS in background
         tasks.add_task(run_with_completion)
@@ -1149,6 +1348,220 @@ async def create_report_issue(
         # unexpected server error
         raise HTTPException(
             status_code=500, detail=f"Failed to create report: {e}")
+
+
+@app.get("/user/sessions")
+async def get_user_session_history(
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(get_user_from_token)
+):
+    """
+    Get session history for a user.
+    Only allows users to access their own sessions.
+
+    Args:
+        limit: Maximum number of sessions to return (default: 50)
+        offset: Number of sessions to skip (default: 0)
+        user: Authenticated user from token
+    """
+
+    try:
+        sessions = get_user_sessions(user["id"], limit=limit, offset=offset)
+
+        return JSONResponse({
+            "user_id": user["id"],
+            "session_count": len(sessions),
+            "limit": limit,
+            "offset": offset,
+            "sessions": sessions
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving sessions: {str(e)}"
+        )
+
+
+@app.get("/user/sessions/{run_id}")
+async def get_user_session_by_run_id(
+    run_id: str,
+    tasks: BackgroundTasks,
+    user: dict = Depends(get_user_from_token)
+):
+    """
+    Get a specific session by run_id and trigger log replay if it's a completed run.
+    """
+    user_id = user["id"]
+    user_email = user.get("email", "")
+
+    # Create composite WebSocket ID
+    ws_id = f"{user_id}_{run_id}"
+
+    try:
+        # Get the specific session
+        session = get_run_session(user_id, run_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found for run_id: {run_id}"
+            )
+
+        # Check if this is a completed/failed run
+        if session.get('status') in ['completed', 'failed']:
+            print(f"🚀 Starting historical replay for run {run_id}")
+            print(f"   User: {user_id} ({user_email})")
+            print(f"   WebSocket ID: {ws_id}")
+            print(f"   Original status: {session.get('status')}")
+
+            async def run_replay():
+                import time
+                replay_start = time.time()
+
+                try:
+                    # Wait a moment for WebSocket to connect
+                    await asyncio.sleep(0.5)
+
+                    # Check if WebSocket is connected using composite ID
+                    if not ws_manager or ws_id not in ws_manager._conns or not ws_manager._conns[ws_id]:
+                        print(
+                            f"⚠️ No WebSocket connection for {ws_id}, skipping replay")
+                        return
+
+                    # Run the replay using the clean function
+                    result = await byor_bridge.replay_mas_historical(
+                        run_id=run_id,
+                        user_id=user_id,
+                        session_data=session,
+                        ws_manager=ws_manager
+                    )
+
+                    replay_time = time.time() - replay_start
+
+                    if result.get("success"):
+                        print(
+                            f"🏁 Replay completed for run {run_id} in {replay_time:.2f}s")
+                        print(
+                            f"   Events processed: {result.get('events_processed')}")
+                        print(f"   Log size: {result.get('log_size')} bytes")
+                        if 'timing' in result:
+                            print(
+                                f"   Download: {result['timing']['download_seconds']:.2f}s")
+                            print(
+                                f"   Processing: {result['timing']['processing_seconds']:.2f}s")
+                    else:
+                        print(
+                            f"❌ Replay failed for run {run_id} after {replay_time:.2f}s")
+                        print(f"   Error: {result.get('error')}")
+
+                except Exception as e:
+                    elapsed = time.time() - replay_start
+                    print(
+                        f"❌ Exception during replay {run_id} after {elapsed:.2f}s: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    print(f"🧹 Replay cleanup completed for run {run_id}")
+
+            # Start replay in background
+            tasks.add_task(run_replay)
+
+            return JSONResponse({
+                "success": True,
+                "user_id": user_id,
+                "run_id": run_id,
+                "ws_id": ws_id,  # Include the WebSocket ID for frontend
+                "session": session,
+                "replay_triggered": True,
+                "message": f"Connect to WebSocket at /ws/{ws_id} to receive replay"
+            })
+
+        else:
+            # For live/pending runs, just return session
+            return JSONResponse({
+                "success": True,
+                "user_id": user_id,
+                "run_id": run_id,
+                "ws_id": ws_id,
+                "session": session,
+                "replay_triggered": False
+            })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving session: {str(e)}"
+        )
+
+
+@app.patch("/user/sessions/{run_id}/name")
+async def update_session_name_endpoint(
+    run_id: str,
+    request: UpdateSessionNameRequest,
+    user: dict = Depends(get_user_from_token)
+):
+    """
+    Update the session name for a specific run.
+    Users can only update their own sessions.
+
+    Args:
+        run_id: The run ID of the session to update
+        request: Request body containing the new session_name
+        user: User info from JWT token
+
+    Returns:
+        JSON response with success status and updated session info
+    """
+    user_id = user["id"]
+
+    try:
+        # Validate session name
+        if not request.session_name or not request.session_name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Session name cannot be empty"
+            )
+
+        # Verify the session exists and belongs to the user
+        session = get_run_session(user_id, run_id)
+        if not session:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found for run_id: {run_id}"
+            )
+
+        # Update the session name
+        success = update_session_name(
+            user_id, run_id, request.session_name.strip())
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to update session name"
+            )
+
+        # Get the updated session
+        updated_session = get_run_session(user_id, run_id)
+
+        return JSONResponse({
+            "success": True,
+            "message": "Session name updated successfully",
+            "run_id": run_id,
+            "session_name": request.session_name.strip(),
+            "session": updated_session
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error updating session name: {str(e)}"
+        )
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)

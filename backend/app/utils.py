@@ -110,33 +110,37 @@ def save_run_request_to_firestore(
 def update_run_status_in_firestore(
     run_id: str,
     status: str,
-    additional_data: Optional[Dict[str, Any]] = None
+    additional_data: Optional[Dict[str, Any]] = None,
+    create_if_missing: bool = True  # ← NEW PARAMETER
 ) -> None:
-    """
-    Update the status of a run in Firestore
+    """Update the status of a run in Firestore."""
+    try:
+        db = get_firestore_client()
+        doc_ref = db.collection("runs").document(run_id)
 
-    Args:
-        run_id: Unique identifier for the run
-        status: New status for the run (e.g., "completed", "failed", "cancelled")
-        additional_data: Any additional data to update
-    """
-    db = get_firestore_client()
-    doc_ref = db.collection("runs").document(run_id)
+        update_data = {
+            "run_id": run_id,
+            "status": status,
+            "updated_at": firestore.SERVER_TIMESTAMP
+        }
 
-    update_data = {
-        "status": status,
-        "updated_at": firestore.SERVER_TIMESTAMP
-    }
+        if status in ["completed", "failed", "cancelled", "at_capacity"]:
+            update_data[f"{status}_at"] = firestore.SERVER_TIMESTAMP
 
-    # Add completion timestamp for terminal states
-    if status in ["completed", "failed", "cancelled"]:
-        update_data[f"{status}_at"] = firestore.SERVER_TIMESTAMP
+        if additional_data:
+            update_data.update(additional_data)
 
-    # Add any additional data
-    if additional_data:
-        update_data.update(additional_data)
+        # ✅ Use set with merge instead of update
+        if create_if_missing:
+            doc_ref.set(update_data, merge=True)
+        else:
+            doc_ref.update(update_data)
 
-    doc_ref.update(update_data)
+        print(f"✅ Updated Firestore status: {run_id} -> {status}")
+
+    except Exception as e:
+        print(f"⚠️ Error updating Firestore: {e}")
+        # Don't raise
 
 
 def get_run_from_firestore(run_id: str) -> Optional[Dict[str, Any]]:

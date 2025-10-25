@@ -11,9 +11,11 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
+from .firebase_storage import get_storage_bucket, get_firestore_client, save_run_session, upload_log_file
 from .user_deployment import build_contract_assets_to_mas
 import tempfile
-
+import time
+from firebase_admin import credentials, firestore, storage
 load_dotenv()
 
 
@@ -850,10 +852,14 @@ async def launch_mas_interactive(
     """
     Launch MAS subprocess with tag-based streaming and error handling
     """
+    print(f'job received: {job}')
+
     # Create log directory if it doesn't exist
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
+    last_save_time = time.time()
+    SAVE_INTERVAL = 30
     # Create timestamp for log files
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
@@ -1010,6 +1016,10 @@ async def launch_mas_interactive(
                     no_output_count = 0
                 except asyncio.TimeoutError:
                     no_output_count += 1
+
+                    if time.time() - last_save_time >= SAVE_INTERVAL:
+                        await save_partial_logs_to_firestore(run_id, str(log_file_path), all_output, job)
+                        last_save_time = time.time()
 
                     current_time = asyncio.get_event_loop().time()
                     time_since_last = current_time - last_char_time
@@ -1394,3 +1404,307 @@ def create_ws_input_handler(run_id: str, input_queue: asyncio.Queue):
         return user_input
 
     return handler
+
+
+async def replay_mas_historical(
+    run_id: str,
+    user_id: str,
+    session_data: dict,
+    ws_manager=None,
+) -> Dict[str, Any]:
+    """
+    Replay a historical MAS log file through WebSocket by parsing it with TagAwareOutputBuffer.
+    """
+    import time
+    start_time = time.time()
+
+    # Use composite ID format for WebSocket
+    ws_id = f"{user_id}_{run_id}"
+
+    try:
+        print(f"[REPLAY] Starting replay for run {run_id}")
+        print(f"[REPLAY] User: {user_id}")
+        print(f"[REPLAY] WebSocket ID: {ws_id}")
+
+        # Get the bucket instance
+        bucket = get_storage_bucket()
+
+        # Construct the blob path
+        blob_path = f"run-logs/{user_id}/{run_id}.log"
+
+        print(f"[REPLAY] Fetching from: {blob_path}")
+
+        # Time the download
+        download_start = time.time()
+
+        # Get the blob
+        blob = bucket.blob(blob_path)
+
+        if not blob.exists():
+            error_msg = f"Log file not found: {blob_path}"
+            print(f"[REPLAY] ERROR: {error_msg}")
+            if ws_manager:
+                await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                    "type": "error",
+                    "data": {"error": error_msg}
+                })
+            return {"success": False, "error": error_msg}
+
+        # Download log content to memory
+        log_content = blob.download_as_text()
+
+        download_time = time.time() - download_start
+        print(
+            f"[REPLAY] Downloaded {len(log_content)} characters from Firebase in {download_time:.2f}s")
+
+        # Send start notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "start",
+                "data": {
+                    "mode": "replay",
+                    "source": "firebase",
+                    "log_size": len(log_content),
+                    "download_time_seconds": download_time
+                }
+            })
+
+        # Initialize output buffer with tag support
+        # Update TagAwareOutputBuffer to use ws_id instead of run_id for sending
+        output_buffer = TagAwareOutputBuffer(
+            ws_manager=ws_manager,
+            run_id=ws_id,  # Pass ws_id as run_id so it sends to correct WebSocket
+            github_url=session_data.get('github_url'),
+            tunnel_url=session_data.get('tunnel_url')
+        )
+
+        # Send replay started notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "process_started",
+                "data": {
+                    "mode": "replay",
+                    "original_status": session_data.get('status'),
+                    "log_path": blob_path
+                }
+            })
+
+        print(f"[REPLAY] Processing log through TagAwareOutputBuffer...")
+        print("-" * 80)
+
+        # Time the processing
+        processing_start = time.time()
+
+        # Process the log character by character (instant, no delays)
+        total_chars = len(log_content)
+        last_progress = 0
+        chars_processed = 0
+
+        for i, char in enumerate(log_content):
+            await output_buffer.add_char(char)
+            chars_processed += 1
+
+            # Send progress updates for large files
+            if total_chars > 50000:  # Only for files > 50KB
+                progress = int((i / total_chars) * 100)
+                if progress >= last_progress + 10:
+                    last_progress = progress
+                    elapsed = time.time() - processing_start
+                    rate = chars_processed / elapsed if elapsed > 0 else 0
+
+                    if ws_manager:
+                        await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                            "type": "replay_progress",
+                            "data": {
+                                "progress": progress,
+                                "chars_processed": chars_processed,
+                                "elapsed_seconds": elapsed,
+                                "chars_per_second": rate
+                            }
+                        })
+
+                    print(
+                        f"[REPLAY] Progress: {progress}% ({chars_processed}/{total_chars} chars) - {rate:.0f} chars/sec")
+
+        # Flush any remaining content
+        await output_buffer.flush()
+
+        processing_time = time.time() - processing_start
+        total_time = time.time() - start_time
+
+        print(f"\n[REPLAY] Processing complete")
+        print(
+            f"[REPLAY] Total events processed: {output_buffer.stream_counter}")
+        print(f"[REPLAY] Processing time: {processing_time:.2f}s")
+        print(
+            f"[REPLAY] Processing rate: {total_chars/processing_time:.0f} chars/sec")
+        print(f"[REPLAY] Total replay time: {total_time:.2f}s")
+
+        # Send completion notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "complete",
+                "data": {
+                    "mode": "replay",
+                    "success": True,
+                    "total_events": output_buffer.stream_counter,
+                    "original_status": session_data.get('status'),
+                    "exit_code": session_data.get('metadata', {}).get('exit_code', 0),
+                    "timing": {
+                        "download_seconds": download_time,
+                        "processing_seconds": processing_time,
+                        "total_seconds": total_time,
+                        "chars_per_second": total_chars / processing_time if processing_time > 0 else 0
+                    }
+                }
+            })
+
+        return {
+            "success": True,
+            "mode": "replay",
+            "events_processed": output_buffer.stream_counter,
+            "log_size": len(log_content),
+            "timing": {
+                "download_seconds": download_time,
+                "processing_seconds": processing_time,
+                "total_seconds": total_time
+            }
+        }
+
+    except Exception as e:
+        error_msg = f"Failed to replay MAS log: {str(e)}"
+        elapsed = time.time() - start_time
+        print(f"\n[REPLAY] ERROR after {elapsed:.2f}s: {error_msg}")
+        import traceback
+        traceback.print_exc()
+
+        # Send error notification
+        if ws_manager:
+            await ws_manager.send_log(ws_id, {  # Changed to ws_id
+                "type": "error",
+                "data": {
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "elapsed_seconds": elapsed
+                }
+            })
+
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "elapsed_seconds": elapsed
+        }
+
+
+async def save_partial_logs_to_firestore(
+    run_id: str,
+    log_file_path: str,
+    all_output: list,
+    job: dict  # Add job parameter to get user_id and other info
+):
+    """
+    Periodically save logs to Firebase Storage and update existing session/run documents.
+    Matches the structure of handle_log_upload_and_session.
+    """
+    try:
+        # Extract needed info from job
+        user_id = job.get('user_id', 'unknown')
+        github_url = job.get('github_url', '')
+        tunnel_url = job.get('tunnel_url', '')
+        session_name = job.get('session_name', run_id)
+
+        # Step 1: Prepare log content
+        if os.path.exists(log_file_path):
+            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                log_content = f.read()
+            file_size = len(log_content)
+            print(
+                f"📂 [PERIODIC] Found log file: {log_file_path} ({file_size} bytes)")
+        else:
+            log_content = ''.join(all_output)
+            file_size = len(log_content)
+            print(f"📝 [PERIODIC] Using memory buffer ({file_size} bytes)")
+
+        if file_size == 0:
+            print(f"⚠️ [PERIODIC] No log content to save")
+            return False
+
+        # Step 2: Upload to Firebase Storage (same as handle_log_upload_and_session)
+        log_url = None
+        try:
+            # Option A: Use your existing upload_log_file function
+            if os.path.exists(log_file_path):
+                log_url = upload_log_file(
+                    user_id=user_id,
+                    run_id=run_id,
+                    log_file_path=log_file_path,
+                    make_public=True
+                )
+            else:
+                # Option B: Direct upload from memory
+                bucket = get_storage_bucket()
+                blob_name = f"run-logs/{user_id}/{run_id}.log"
+                blob = bucket.blob(blob_name)
+                blob.upload_from_string(log_content)
+                blob.make_public()
+                log_url = blob.public_url
+
+            if log_url:
+                print(f"✅ [PERIODIC] Log uploaded to storage")
+        except Exception as e:
+            print(f"⚠️ [PERIODIC] Failed to upload to storage: {e}")
+
+        # Step 3: Prepare metadata (similar to handle_log_upload_and_session)
+        metadata = {
+            "last_update": datetime.now().isoformat(),
+            "log_size": file_size,
+            "is_partial": True,
+            "log_url": log_url,
+            "status": "running",
+            "partial_log_saved": True
+        }
+
+        # Step 4: Update existing documents (not create new ones)
+        db = get_firestore_client()
+
+        # Update or create session (using save_run_session if you have it)
+        try:
+            # Option A: Use your existing save_run_session function
+            save_run_session(
+                user_id=user_id,
+                user_email=job.get('user_email', ''),
+                run_id=run_id,
+                log_url=log_url,
+                github_url=github_url,
+                tunnel_url=tunnel_url,
+                session_name=session_name,
+                status="running",
+                additional_metadata=metadata,
+            )
+            print(f"✅ [PERIODIC] Session updated")
+        except:
+            # Option B: Direct update if save_run_session is not available
+            session_ref = db.collection(
+                "sessions").document(f"{user_id}_{run_id}")
+            session_ref.set({
+                "user_id": user_id,
+                "run_id": run_id,
+                "log_url": log_url,
+                "github_url": github_url,
+                "tunnel_url": tunnel_url,
+                "session_name": session_name,
+                "status": "running",
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                **metadata
+            }, merge=True)  # merge=True to update existing
+            print(f"✅ [PERIODIC] Session document updated")
+
+        print(f"✅ [PERIODIC] Saved logs for {run_id} ({file_size} bytes)")
+        return True
+
+    except Exception as e:
+        print(f"❌ [PERIODIC] Failed to save: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

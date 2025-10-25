@@ -5,6 +5,9 @@ from typing import Dict, List, Any
 from web3 import Web3
 from .constants import BASE_DIR
 from .models.contract_asset import ContractAsset
+import subprocess
+from pathlib import Path
+from typing import Dict, Any
 
 
 def load_foundry_artifacts(base: Path) -> List[Dict[str, Any]]:
@@ -32,64 +35,135 @@ def load_foundry_artifacts(base: Path) -> List[Dict[str, Any]]:
 
 
 def stitch_sources(base: Path, sources: Dict[str, Any], contract_name: str = None) -> str:
-    """Get source code for the contract, searching by contract name if provided"""
+    """Get source code for the contract dynamically searching in src and all subdirectories"""
 
-    # If we have a contract name, try to find the matching source file
-    if contract_name:
-        print(f"Looking for source file for contract: {contract_name}")
+    if not contract_name:
+        return "// source not fully resolved"
 
-        # For Mock contracts, look in test files first
-        if contract_name.startswith("Mock"):
-            # Check test directory for mock contracts
-            test_dir = base / "test"
-            if test_dir.exists():
-                for test_file in test_dir.glob("**/*.sol"):
-                    if test_file.is_file():
-                        content = test_file.read_text(encoding="utf-8")
-                        # Check if this file contains the mock contract
-                        if f"contract {contract_name}" in content:
-                            print(
-                                f"Found {contract_name} in: {test_file.relative_to(base)}")
-                            return content
+    print(f"Looking for source file for contract: {contract_name}")
 
-            # If not found in test, it might be using a real contract as mock
-            # Strip "Mock" prefix and look for the base contract
-            base_contract_name = contract_name.replace("Mock", "")
-            for file_path in sources.keys():
-                if base_contract_name in file_path and file_path.endswith(".sol"):
-                    full_path = base / file_path
-                    if full_path.exists():
+    src_dir = base / "src"
+    if not src_dir.exists():
+        print(f"⚠️ src directory not found at: {src_dir}")
+        return "// source not fully resolved"
+
+    try:
+        # Strategy 1: Use ripgrep for fast file searching (checks src/ and all subdirs)
+        cmd = ["rg", "--files", "--glob",
+               f"**/{contract_name}.sol", str(src_dir)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
+        if result.returncode == 0 and result.stdout.strip():
+            file_paths = result.stdout.strip().split('\n')
+            for file_path in file_paths:
+                path = Path(file_path)
+                if path.exists():
+                    content = path.read_text(encoding="utf-8")
+                    # Verify the contract is actually defined in this file
+                    if f"contract {contract_name}" in content or f"abstract contract {contract_name}" in content:
+                        print(f"Found exact match: {path.relative_to(base)}")
+                        return content
+
+        # Strategy 2: Search for files containing the contract definition
+        cmd = [
+            "rg", "-l", f"^\\s*(contract|abstract\\s+contract)\\s+{contract_name}\\b", "--glob", "*.sol", str(src_dir)]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10)
+
+        if result.returncode == 0 and result.stdout.strip():
+            file_paths = result.stdout.strip().split('\n')
+            if file_paths:
+                path = Path(file_paths[0])  # Take first match
+                if path.exists():
+                    print(
+                        f"Found {contract_name} definition in: {path.relative_to(base)}")
+                    return path.read_text(encoding="utf-8")
+
+        # Strategy 3: Broader search - any .sol file with contract name in filename
+        cmd = ["rg", "--files", "--glob",
+               f"**/*{contract_name}*.sol", str(src_dir)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
+        if result.returncode == 0 and result.stdout.strip():
+            file_paths = result.stdout.strip().split('\n')
+            for file_path in file_paths:
+                path = Path(file_path)
+                if path.exists():
+                    content = path.read_text(encoding="utf-8")
+                    if f"contract {contract_name}" in content or f"abstract contract {contract_name}" in content:
                         print(
-                            f"Using base contract for {contract_name}: {file_path}")
-                        return full_path.read_text(encoding="utf-8")
+                            f"Found {contract_name} in: {path.relative_to(base)}")
+                        return content
 
-        # For non-mock contracts, look for exact match in src/
-        else:
-            # First try exact filename match
-            expected_file = f"src/{contract_name}.sol"
-            if expected_file in sources:
-                full_path = base / expected_file
-                if full_path.exists():
-                    print(f"Found exact match: {expected_file}")
-                    return full_path.read_text(encoding="utf-8")
+    except subprocess.TimeoutExpired:
+        print(f"⚠️ Search timed out for contract: {contract_name}")
+        return stitch_sources_fallback(base, contract_name)
+    except FileNotFoundError:
+        print("⚠️ ripgrep not found. Using fallback search...")
+        return stitch_sources_fallback(base, contract_name)
+    except Exception as e:
+        print(f"⚠️ Error using ripgrep: {e}")
+        return stitch_sources_fallback(base, contract_name)
 
-            # Otherwise search all source files for the contract definition
-            for file_path in sources.keys():
-                if file_path.endswith(".sol"):
-                    full_path = base / file_path
-                    if full_path.exists():
-                        content = full_path.read_text(encoding="utf-8")
-                        if f"contract {contract_name}" in content:
-                            print(f"Found {contract_name} in: {file_path}")
-                            return content
+    # If ripgrep didn't find anything, use fallback
+    return stitch_sources_fallback(base, contract_name)
 
-    # Fallback: return first source file in src/ (original behavior)
-    for file_path in sources.keys():
-        if file_path.startswith("src/") and file_path.endswith(".sol"):
-            full_path = base / file_path
-            if full_path.exists():
-                print(f"Fallback - using: {file_path}")
-                return full_path.read_text(encoding="utf-8")
+
+def stitch_sources_fallback(base: Path, contract_name: str) -> str:
+    """Python fallback when ripgrep is not available"""
+
+    src_dir = base / "src"
+    if not src_dir.exists():
+        return "// source not fully resolved"
+
+    print("Using Python fallback search...")
+
+    # First: Check for exact filename match anywhere in src tree
+    exact_matches = list(src_dir.glob(f"**/{contract_name}.sol"))
+    for sol_file in exact_matches:
+        if sol_file.is_file():
+            content = sol_file.read_text(encoding="utf-8")
+            if f"contract {contract_name}" in content or f"abstract contract {contract_name}" in content:
+                print(f"Found exact match: {sol_file.relative_to(base)}")
+                return content
+
+    # Second: Search all .sol files for contract definition
+    all_sol_files = list(src_dir.glob("**/*.sol"))
+    for sol_file in all_sol_files:
+        if sol_file.is_file():
+            try:
+                content = sol_file.read_text(encoding="utf-8")
+                # Check for contract definition (including abstract contracts)
+                if (f"contract {contract_name} " in content or
+                    f"contract {contract_name}{{" in content or
+                        f"abstract contract {contract_name}" in content):
+                    print(
+                        f"Found {contract_name} in: {sol_file.relative_to(base)}")
+                    return content
+            except Exception as e:
+                continue
+
+    # Third: Partial filename match as last resort
+    for sol_file in all_sol_files:
+        if contract_name.lower() in sol_file.stem.lower():
+            try:
+                content = sol_file.read_text(encoding="utf-8")
+                if f"contract {contract_name}" in content:
+                    print(
+                        f"Found {contract_name} in: {sol_file.relative_to(base)}")
+                    return content
+            except Exception as e:
+                continue
+
+    print(f"⚠️ Could not find source file for contract: {contract_name}")
+
+    # Debug: Show what files are available
+    if all_sol_files:
+        print(f"Available .sol files in src/:")
+        for f in all_sol_files[:10]:
+            print(f"  - {f.relative_to(base)}")
+        if len(all_sol_files) > 10:
+            print(f"  ... and {len(all_sol_files) - 10} more files")
 
     return "// source not fully resolved"
 
