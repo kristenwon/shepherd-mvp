@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
-from .firebase_storage import get_storage_bucket, get_firestore_client, save_run_session, upload_log_file
+from .firebase_storage import get_storage_bucket, get_firestore_client, save_run_session, upload_log_file, upload_user_assets_zip
 from .user_deployment import build_contract_assets_to_mas
 import tempfile
 import time
@@ -853,6 +853,33 @@ async def launch_mas_interactive(
     Launch MAS subprocess with tag-based streaming and error handling
     """
     print(f'job received: {job}')
+
+    user_id = job.get('user_id', 'unknown')
+
+    # Save the ZIP file to Firebase Storage immediately
+    print(f"📦 Saving ZIP file to Firebase Storage for run {run_id}")
+    zip_upload_result = upload_user_assets_zip(
+        user_id=user_id,
+        run_id=run_id,
+        zip_data=assets_data,
+        signed_url_expiration_days=30  # Adjust as needed
+    )
+
+    if zip_upload_result:
+        print(f"✅ ZIP file saved successfully")
+        print(f"   Storage path: {zip_upload_result['storage_path']}")
+        print(f"   File size: {zip_upload_result['file_size']} bytes")
+        # You could also send this info via WebSocket if needed
+        if ws_manager:
+            await ws_manager.send_log(run_id, {
+                "type": "assets_uploaded",
+                "data": {
+                    "storage_path": zip_upload_result['storage_path'],
+                    "file_size": zip_upload_result['file_size'],
+                }
+            })
+    else:
+        print(f"⚠️ Failed to save ZIP file to Firebase Storage")
 
     # Create log directory if it doesn't exist
     log_path = Path(log_dir)

@@ -646,3 +646,94 @@ def update_session_name(
         import traceback
         traceback.print_exc()
         return False
+
+
+# Add to utils.py
+
+def upload_user_assets_zip(
+    user_id: str,
+    run_id: str,
+    zip_data: bytes,
+    signed_url_expiration_days: int = 30
+) -> Optional[Dict[str, Any]]:
+    """
+    Upload user assets ZIP file to Firebase Storage and create Firestore record.
+
+    Args:
+        user_id: User ID
+        run_id: Run ID (will be used as filename)
+        zip_data: ZIP file content as bytes
+        signed_url_expiration_days: Days until signed URL expires (default 30)
+
+    Returns:
+        Dict with storage_path and download_url, or None if failed
+    """
+    try:
+        bucket = get_storage_bucket()
+        db = get_firestore_client()
+
+        # Create storage path: user-assets-zip/{user_id}/{run_id}.zip
+        storage_path = f"user-assets-zip/{user_id}/{run_id}.zip"
+        blob = bucket.blob(storage_path)
+
+        print(
+            f"📦 Uploading ZIP file to: {storage_path} ({len(zip_data)} bytes)")
+
+        # Upload the ZIP data
+        blob.upload_from_string(zip_data, content_type="application/zip")
+        blob.cache_control = "private, max-age=3600"
+        blob.patch()
+
+        # Save record to Firestore
+        doc_data = {
+            "run_id": run_id,
+            "user_id": user_id,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "storage_path": storage_path,
+            "file_size": len(zip_data),
+            "expiration_days": signed_url_expiration_days,
+            "content_type": "application/zip"
+        }
+
+        # Use run_id as document ID for easy retrieval
+        doc_ref = db.collection("user-assets-zip").document(run_id)
+        doc_ref.set(doc_data)
+
+        print(f"✅ ZIP file uploaded and record saved for run {run_id}")
+
+        return {
+            "storage_path": storage_path,
+            "file_size": len(zip_data)
+        }
+
+    except Exception as e:
+        print(f"❌ Failed to upload ZIP file: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def get_user_assets_zip_url(run_id: str) -> Optional[str]:
+    """
+    Get the download URL for a previously uploaded assets ZIP.
+
+    Args:
+        run_id: Run ID
+
+    Returns:
+        Download URL or None if not found
+    """
+    try:
+        db = get_firestore_client()
+        doc_ref = db.collection("user-assets-zip").document(run_id)
+        doc = doc_ref.get()
+
+        if doc.exists:
+            data = doc.to_dict()
+            return data.get("download_url")
+
+        return None
+
+    except Exception as e:
+        print(f"❌ Failed to retrieve ZIP URL: {e}")
+        return None
