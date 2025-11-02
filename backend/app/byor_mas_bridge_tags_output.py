@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
 from .utils import save_hypothesis_to_firestore, repo_display_name
-from .firebase_storage import get_storage_bucket, get_firestore_client, save_run_session, upload_log_file
+from .firebase_storage import get_storage_bucket, get_firestore_client, save_run_session, upload_log_file, upload_user_assets_zip
 from .user_deployment import build_contract_assets_to_mas
 import tempfile
 import time
@@ -282,6 +282,7 @@ class TagParser:
         'SUMMARY': r'<<<SUMMARY>>>(.*?)<<<END_SUMMARY>>>',
         'DESCRIPTION': r'<<<DESCRIPTION>>>(.*?)<<<END_DESCRIPTION>>>',
         'PLANNER_STEP': r'<<<PLANNER_STEP>>>(.*?)<<<END_PLANNER_STEP>>>',
+        'TOKEN_USAGE': r'<<<TOKEN_USAGE>>>(.*?)<<<END_TOKEN_USAGE>>>'
     }
 
     def __init__(self):
@@ -575,7 +576,7 @@ class PromptDetector:
 class TagAwareOutputBuffer:
     """Buffer that ONLY streams tagged content, ignoring regular output"""
 
-    def __init__(self, ws_manager, run_id, github_url=None, tunnel_url=None):
+    def __init__(self, ws_manager, run_id, github_url=None, tunnel_url=None, user_id=None):
         self.ws_manager = ws_manager
         self.run_id = run_id
         self.parser = TagParser()
@@ -600,6 +601,7 @@ class TagAwareOutputBuffer:
         self.handled_hypothesis_via_tag = False
         self.github_url = github_url
         self.tunnel_url = tunnel_url
+        self.user_id = user_id
         self.auto_response_pending = None
 
     async def add_char(self, char: str):
@@ -797,31 +799,69 @@ class TagAwareOutputBuffer:
             # This will remove <<<END_AGENT>>> even inside JSON strings
             content = clean_all_tags(content)
 
+            if tag_type == "TOKEN_USAGE":
+                print(
+                    f"[TOKEN USAGE----------] Raw content preview: {content[:200]}...")
+
+                # Save to Firestore if user_id is available
+                if self.user_id and self.user_id != 'unknown':
+                    try:
+                        db = get_firestore_client()
+
+                        # Parse the content to get token data
+                        total_tokens_used = 0
+                        if content.startswith('{') and content.endswith('}'):
+                            outer_data = json.loads(content)
+
+                            # The "message" field contains another JSON string
+                            if "message" in outer_data:
+                                # Parse the inner JSON from the message field
+                                token_data = json.loads(outer_data["message"])
+
+                                # Extract total_tokens from totals
+                                if "totals" in token_data and "total_tokens" in token_data["totals"]:
+                                    total_tokens_used = token_data["totals"]["total_tokens"]
+                                    print(
+                                        f"[TOKEN USAGE] Total tokens used in this run: {total_tokens_used}")
+
+                                # Optional: Print breakdown
+                                if "by_model" in token_data:
+                                    print(
+                                        f"[TOKEN USAGE] By model: {token_data['by_model']}")
+
+                        # Update user document with both run_count and total_tokens
+                        user_ref = db.collection(
+                            "users").document(self.user_id)
+
+                        if total_tokens_used > 0:
+                            user_ref.set({
+                                "run_count": firestore.Increment(1),
+                                "total_tokens": firestore.Increment(total_tokens_used)
+                            }, merge=True)
+                            print(
+                                f"[TOKEN USAGE] Updated user {self.user_id}: +1 run, +{total_tokens_used} tokens")
+                        else:
+                            # Just increment run count if we couldn't get token count
+                            user_ref.set({
+                                "run_count": firestore.Increment(1)
+                            }, merge=True)
+                            print(
+                                f"[TOKEN USAGE] Updated run count for user {self.user_id} (no token data)")
+
+                    except Exception as e:
+                        print(f"[TOKEN USAGE] Failed to update Firestore: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+            # Now parse content to data for all tags
             if content.startswith('{') and content.endswith('}'):
-                # Now parse the already-cleaned JSON
+                # Parse the JSON FIRST before any other processing
                 data = json.loads(content)
 
-                # Special handling for reporter agent with markdown content
-                if tag_type == "AGENT":
-                    agent_type = data.get("agent_type", "")
-                    agent_content = data.get("content", "")
-
-                    if agent_type == "reporter" and "markdown" in agent_content.lower():
-                        # Find the first pipe character which indicates table start
-                        pipe_index = agent_content.find("|")
-
-                        if pipe_index != -1:
-                            # Extract from the first pipe to the end
-                            markdown_table = agent_content[pipe_index:].strip()
-
-                            # Also remove any trailing markdown code block markers if present
-                            if markdown_table.endswith("```"):
-                                markdown_table = markdown_table[:-3].strip()
-
-                            # Update the data with just the markdown table
-                            data["content"] = markdown_table
-                            # Add a flag for frontend
-                            data["is_markdown_table"] = True
+                # NOW we can do special handling for specific tag types
+                # Special handling for reporter agent
+                if tag_type == "AGENT" and data.get("agent_type") == "reporter":
+                    data["is_reporter"] = True
             else:
                 data = {"content": content}
 
@@ -853,6 +893,33 @@ async def launch_mas_interactive(
     Launch MAS subprocess with tag-based streaming and error handling
     """
     print(f'job received: {job}')
+
+    user_id = job.get('user_id', 'unknown')
+
+    # Save the ZIP file to Firebase Storage immediately
+    print(f"📦 Saving ZIP file to Firebase Storage for run {run_id}")
+    zip_upload_result = upload_user_assets_zip(
+        user_id=user_id,
+        run_id=run_id,
+        zip_data=assets_data,
+        signed_url_expiration_days=30  # Adjust as needed
+    )
+
+    if zip_upload_result:
+        print(f"✅ ZIP file saved successfully")
+        print(f"   Storage path: {zip_upload_result['storage_path']}")
+        print(f"   File size: {zip_upload_result['file_size']} bytes")
+        # You could also send this info via WebSocket if needed
+        if ws_manager:
+            await ws_manager.send_log(run_id, {
+                "type": "assets_uploaded",
+                "data": {
+                    "storage_path": zip_upload_result['storage_path'],
+                    "file_size": zip_upload_result['file_size'],
+                }
+            })
+    else:
+        print(f"⚠️ Failed to save ZIP file to Firebase Storage")
 
     # Create log directory if it doesn't exist
     log_path = Path(log_dir)
@@ -996,7 +1063,8 @@ async def launch_mas_interactive(
             ws_manager,
             run_id,
             github_url=github_url,  # Pass the URLs here
-            tunnel_url=tunnel_url
+            tunnel_url=tunnel_url,
+            user_id=user_id
         )
         detector = output_buffer.prompt_detector
 

@@ -3,13 +3,13 @@ import shutil
 from fastapi import File, UploadFile, Form
 import asyncio
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, status
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, status, Path as PathParam
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import traceback
 from typing import Dict, Optional, List, Tuple
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 import os
 import time
@@ -36,7 +36,8 @@ from typing import Optional
 import zipfile
 import io
 from .utils import save_run_request_to_firestore, update_run_status_in_firestore
-from .firebase_storage import init_firebase, ReportIssueService, upload_log_file, save_run_session, get_user_sessions, save_error_log_to_storage, get_run_session, update_session_name
+from .firebase_storage import init_firebase, ReportIssueService, upload_log_file, save_run_session, get_user_sessions, save_error_log_to_storage, get_run_session, update_session_name, get_firestore_client
+from .firebase.firebase_storage_download import FirebaseDownloadService
 from fastapi import Depends, Header, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
@@ -1561,7 +1562,85 @@ async def update_session_name_endpoint(
             status_code=500,
             detail=f"Error updating session name: {str(e)}"
         )
+download_service = FirebaseDownloadService(
+    prefix="user-assets-zip/",
+    signed_url_ttl=timedelta(hours=1)
+)
 
+
+@app.get("/stream/{user_id}/{file_id}")
+async def stream_download_file(
+    user_id: str = PathParam(..., description="User ID from the file path"),
+    file_id: str = PathParam(..., description="File ID (zip filename)")
+):
+    """
+    Stream download a zip file from Firebase Storage
+
+    This endpoint downloads the file and streams it directly to the client.
+    Perfect for immediate downloads without generating temporary URLs.
+    """
+    # Construct the file path
+    file_path = f"user-assets-zip/{user_id}/{file_id}"
+
+    try:
+        # Download file to stream
+        file_stream, filename, file_size = download_service.download_file_to_stream(
+            file_path)
+
+        # Return streaming response
+        return StreamingResponse(
+            file_stream,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Length": str(file_size),
+                "Cache-Control": "no-cache",
+                "X-File-Path": file_path
+            }
+        )
+    except FileNotFoundError as e:
+        print(f"File not founxd: {file_path}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        print(f"Error streaming file {file_path}: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to download file: {str(e)}")
+
+
+@app.get("/isUserEligible")
+async def is_user_eligible(user_info: str = Depends(get_user_from_token)):
+
+    try:
+        db = get_firestore_client()
+        user_id = user_info["id"]
+        user_doc_ref = db.collection("users").document(user_id)
+        user_doc = user_doc_ref.get()
+        print(
+            f"User document: {user_doc.to_dict() if user_doc.exists else 'Not found'}")
+        is_eligible = False
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            if "isEligible" not in user_data:
+                # Create the field with default value of True
+                user_doc_ref.update({
+                    "isEligible": True
+                })
+                print(
+                    f"Created isEligible field for user {user_id} with default value: True")
+                is_eligible = True
+            else:
+                # Field exists, use its value
+                is_eligible = user_data.get("isEligible")
+
+        return JSONResponse({
+            "is_eligible": is_eligible
+        })
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error checking eligibility: {str(e)}"
+        )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)
