@@ -800,9 +800,6 @@ class TagAwareOutputBuffer:
             content = clean_all_tags(content)
 
             if tag_type == "TOKEN_USAGE":
-                print(
-                    f"[TOKEN USAGE----------] Raw content preview: {content[:200]}...")
-
                 # Save to Firestore if user_id is available
                 if self.user_id and self.user_id != 'unknown':
                     try:
