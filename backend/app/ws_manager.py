@@ -128,9 +128,6 @@ class WebSocketManager:
         if run_id not in self._conns or not self._conns[run_id]:
             if run_id in self._last_activity:
                 del self._last_activity[run_id]
-            # Clean up buffers if no connections
-            if run_id in self._buffers:
-                del self._buffers[run_id]
                 # Cancel the run if no clients are connected
             if self._run_manager:
                 asyncio.create_task(self._cancel_orphaned_run(run_id))
@@ -143,6 +140,9 @@ class WebSocketManager:
         if run_id not in self._conns or not self._conns[run_id]:
             print(
                 f"🚫 Cancelling orphaned run {run_id[:8]} (no connected clients)")
+            # Clean up buffer only when actually cancelling
+            if run_id in self._buffers:
+                del self._buffers[run_id]
             if self._run_manager:
                 success = await self._run_manager.cancel_run(run_id)
                 if success:
