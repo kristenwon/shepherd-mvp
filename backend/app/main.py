@@ -1623,11 +1623,11 @@ async def is_user_eligible(user_info: str = Depends(get_user_from_token)):
             if "isEligible" not in user_data:
                 # Create the field with default value of True
                 user_doc_ref.update({
-                    "isEligible": True
+                    "isEligible": False
                 })
                 print(
-                    f"Created isEligible field for user {user_id} with default value: True")
-                is_eligible = True
+                    f"Created isEligible field for user {user_id} with default value: False")
+                is_eligible = False
             else:
                 # Field exists, use its value
                 is_eligible = user_data.get("isEligible")
