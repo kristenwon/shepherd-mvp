@@ -187,11 +187,14 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
             broadcast_data = json.load(f)
 
         for tx in broadcast_data.get("transactions", []):
-            if tx.get("transactionType") == "CREATE":
-                contract_name = tx.get("contractName")
-                contract_address = tx.get("contractAddress")
-                if contract_name and contract_address:
-                    targets[contract_name] = contract_address
+            contract_name = tx.get("contractName")
+            contract_address = tx.get("contractAddress")
+            if contract_name is None:
+                print(
+                    f"contractname is null for transaction with address: {contract_address}")
+                continue
+            if contract_name and contract_address:
+                targets[contract_name] = contract_address
 
     # 3) match deployed contracts to artifacts
     for label, addr in targets.items():
