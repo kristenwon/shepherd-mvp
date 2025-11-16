@@ -8,6 +8,8 @@ from .models.contract_asset import ContractAsset
 import subprocess
 from pathlib import Path
 from typing import Dict, Any
+from .models.scoped_contracts import ContractsList, Contract
+import shutil
 
 
 def load_foundry_artifacts(base: Path) -> List[Dict[str, Any]]:
@@ -168,7 +170,7 @@ def stitch_sources_fallback(base: Path, contract_name: str) -> str:
     return "// source not fully resolved"
 
 
-def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str, tunnel_url: str):
+def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str, tunnel_url: str, contract_list: ContractsList) -> Path:
     """Modified version that saves to specified output directory"""
     base = Path(input_dir)
     repo_path = Path(output_dir)
@@ -182,6 +184,7 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
     broadcast_dir = base / "broadcast"
 
     # Look for run-latest.json in broadcast/*/31337/
+    deployed_contract_name_list = []
     for run_latest_file in broadcast_dir.rglob("*/31337/run-latest.json"):
         with open(run_latest_file, 'r') as f:
             broadcast_data = json.load(f)
@@ -195,6 +198,35 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
                 continue
             if contract_name and contract_address:
                 targets[contract_name] = contract_address
+                deployed_contract_name_list.append(contract_name)
+
+        # 2.5) Write non-deployed-contract-in-scope.json summary in repo_path
+        non_deployed_contracts_in_scope = []
+        for contract in contract_list.contracts:
+            full_name = contract.contract_name
+            print(f'full_name -----: {full_name}')
+            if not contract.is_deployed and contract.is_in_scope:
+                # Normalize to base name for comparison (e.g. "Lender.sol" -> "Lender")
+                base_name = full_name.rsplit(".", 1)[0]
+                print(f"Checking non-deployed in-scope contract: {base_name}")
+                print(f'contract -----: {contract}')
+                if base_name not in deployed_contract_name_list:
+                    non_deployed_contracts_in_scope.append(
+                        {
+                            "contract_name": full_name,
+                            "is_deployed": contract.is_deployed,
+                            "is_in_scope": contract.is_in_scope,
+                        }
+                    )
+
+        non_deployed_path = repo_path / "non-deployed-contract-in-scope.json"
+        non_deployed_path.write_text(
+            json.dumps(
+                {"contracts": non_deployed_contracts_in_scope}, indent=4),
+            encoding="utf-8",
+        )
+        print(
+            f"Created non_deployed_contracts_in_scope file: {non_deployed_path}")
 
     # 3) match deployed contracts to artifacts
     for label, addr in targets.items():
@@ -225,6 +257,19 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
         short = addr[:6] + "…" + addr[-4:]
         output_file = repo_path / f"{asset['contract_name']}_{short}.json"
         output_file.write_text(json.dumps(asset, indent=2), encoding="utf-8")
+
+        src_in = base / "src"
+        src_out = repo_path / "src"
+
+        if src_in.exists() and src_in.is_dir():
+            # Remove existing destination folder so copytree won't raise
+            if src_out.exists():
+                shutil.rmtree(src_out)
+
+            shutil.copytree(src_in, src_out)
+            print(f"Copied src directory from {src_in} → {src_out}")
+        else:
+            print(f"No src folder found at: {src_in}")
 
         print(f"Created asset: {output_file}")
 

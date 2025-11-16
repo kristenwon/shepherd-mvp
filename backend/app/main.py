@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
-from .utils import save_email_to_firestore
+from .utils import save_email_to_firestore, get_all_contracts
 from .ws_manager import WebSocketManager
 from . import dvd1_mas_bridge_tags_output as dvd1_bridge
 from . import dvd2_mas_bridge_tags_output as dvd2_bridge
@@ -41,6 +41,7 @@ from .firebase.firebase_storage_download import FirebaseDownloadService
 from fastapi import Depends, Header, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
+from .models.scoped_contracts import ContractsList, Contract
 
 load_dotenv()
 
@@ -779,7 +780,7 @@ async def handle_log_upload_and_session(
                 tunnel_url=tunnel_url,
                 session_name=session_name,
                 status=status,
-                additional_metadata=metadata
+                additional_metadata=metadata,
             )
             print(f"✅ Session saved")
         except Exception as e:
@@ -793,6 +794,7 @@ async def start_run_byor(
     github_url: str = Form(...),
     tunnel_url: str = Form(...),
     session_name: str = Form(...),
+    contracts: str = Form(...),
     assets: Optional[UploadFile] = File(None),
     user: str = Depends(get_user_from_token)
 ):
@@ -865,7 +867,6 @@ async def start_run_byor(
             run_id=run_id,
             github_url=github_url,
             tunnel_url=tunnel_url,
-            user_id=user_id,
             assets_path=None,  # No longer storing path
             assets_metadata=assets_metadata,  # Basic metadata only
             status="pending"
@@ -905,7 +906,14 @@ async def start_run_byor(
             error_info = None
 
             try:
-                # Run MAS
+                try:
+                    contracts_list = ContractsList.model_validate_json(
+                        contracts)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid contracts payload: {e}",
+                    )
                 result = await byor_bridge.launch_mas_interactive(
                     run_id=run_id,
                     github_url=github_url,
@@ -913,6 +921,7 @@ async def start_run_byor(
                     assets_data=assets_data,
                     job=job_data,
                     input_handler=input_handler,
+                    contractList=contracts_list,
                     ws_manager=ws_manager,
                     log_dir="./backend/logs",
                     input_queues=input_queues,
@@ -1641,6 +1650,73 @@ async def is_user_eligible(user_info: str = Depends(get_user_from_token)):
             status_code=500,
             detail=f"Error checking eligibility: {str(e)}"
         )
+
+
+@app.post("/get-contract-name-list")
+async def get_contract_name_list(
+    run_id: str = Form(...),
+    assets: Optional[UploadFile] = File(None),
+    user: str = Depends(get_user_from_token)
+):
+    # Extract user information
+    user_id = user["id"]
+    user_email = user["email"]
+
+    print(f"🔐 Authenticated user: {user_id} ({user_email})")
+
+    # Initialize variables
+    assets_data = None
+    assets_metadata = None
+
+    # Handle the uploaded file if provided (read directly into memory)
+    if assets:
+        # Check file size limit (100MB)
+        MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+        if assets.size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size is {MAX_FILE_SIZE / (1024*1024)}MB"
+            )
+
+        try:
+            # Read the file directly into memory
+            assets_data = await assets.read()
+            print(
+                f"📦 Loaded assets file into memory: {assets.filename} ({len(assets_data)} bytes)")
+
+            # Basic metadata for logging (not for storage)
+            assets_metadata = {
+                "original_filename": assets.filename,
+                "content_type": assets.content_type,
+                "size": len(assets_data)
+            }
+
+            # Verify it's a valid ZIP file
+            import io
+            try:
+                with zipfile.ZipFile(io.BytesIO(assets_data), 'r') as zf:
+                    zip_contents = zf.namelist()
+                    assets_metadata["is_valid_zip"] = True
+                    assets_metadata["file_count"] = len(zip_contents)
+                    print(f"   ZIP contents: {len(zip_contents)} files")
+            except zipfile.BadZipFile:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid ZIP file provided"
+                )
+            # list all the files in extract_dir
+            try:
+                contract_list = get_all_contracts(run_id, assets_data)
+            except Exception as e:
+                print(f"❌ Error listing contracts: {e}")
+
+            return contract_list
+        except Exception as e:
+            print(f"Error processing assets file: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Error processing assets file: {str(e)}"
+            )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)

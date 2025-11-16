@@ -12,6 +12,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from google.cloud.storage import Blob
 from google.cloud.storage.bucket import Bucket
+from .models.scoped_contracts import ContractsList, Contract
 
 # ----------------------------- Constants -----------------------------
 
@@ -344,6 +345,7 @@ def save_run_session(
     user_id: str,
     user_email: str,
     run_id: str,
+    contract_list: Optional[ContractsList] = None,
     log_url: Optional[str] = None,
     github_url: Optional[str] = None,
     tunnel_url: Optional[str] = None,
@@ -395,17 +397,22 @@ def save_run_session(
             session_data["tunnel_url"] = tunnel_url
         if additional_metadata:
             session_data["metadata"] = additional_metadata
+        if contract_list:
+            session_data["contract_list"] = [
+                contract.model_dump()
+                for contract in contract_list.contracts
+            ]
 
         session_data["session_name"] = session_name
         # Save to run-sessions collection with composite ID
         composite_id = f"{user_id}_{run_id}"
         run_sessions_ref = db.collection("run-sessions").document(composite_id)
-        run_sessions_ref.set(session_data)
+        run_sessions_ref.set(session_data, merge=True)
 
         # Save to user's sessions subcollection
         user_session_ref = db.collection("user-sessions").document(
             user_id).collection("sessions").document(run_id)
-        user_session_ref.set(session_data)
+        user_session_ref.set(session_data, merge=True)
 
         print(f"✅ Saved run session: {composite_id}")
 
