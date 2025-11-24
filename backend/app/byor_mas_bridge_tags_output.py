@@ -1,21 +1,20 @@
 # deployment ver - complete with tag parsing and error handling
-import zipfile
 import asyncio
 import os
 import re
-import io
 import json
-import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from dotenv import load_dotenv
-from .utils import save_hypothesis_to_firestore, repo_display_name
+from .utils import save_hypothesis_to_firestore, repo_display_name, extract_zip_safely
 from .firebase_storage import get_storage_bucket, get_firestore_client, save_run_session, upload_log_file, upload_user_assets_zip
 from .user_deployment import build_contract_assets_to_mas
 import tempfile
 import time
 from firebase_admin import credentials, firestore, storage
+from .models.scoped_contracts import ContractsList, Contract
+
 load_dotenv()
 
 
@@ -50,219 +49,6 @@ def clean_all_tags(text):
     cleaned = re.sub(r'^[^<]*>>>', '', cleaned)
 
     return cleaned.strip()
-
-
-def detect_root_folder(members: List[str]) -> Optional[str]:
-    """
-    More robust detection of common root folder in ZIP
-    """
-    if not members:
-        return None
-
-    # Method 1: Check if all files share a common prefix directory
-    # Get all top-level items
-    top_level_items = set()
-    for member in members:
-        parts = member.split('/')
-        if parts[0]:  # Ignore empty parts
-            top_level_items.add(parts[0])
-
-    # If there's exactly one top-level item and it appears in all paths
-    if len(top_level_items) == 1:
-        potential_root = list(top_level_items)[0] + '/'
-
-        # Verify all members start with this root (except the root itself)
-        all_under_root = all(
-            m == potential_root.rstrip('/') or m.startswith(potential_root)
-            for m in members
-        )
-
-        if all_under_root:
-            return potential_root
-
-    # Method 2: Check for common path patterns (e.g., "projectname-main/")
-    # Common patterns from GitHub/GitLab archives
-    for member in members:
-        if '/' in member:
-            potential_root = member.split('/')[0] + '/'
-            # Check if this looks like an auto-generated archive root
-            # (contains version, branch name, or common suffixes)
-            if any(suffix in potential_root.lower()
-                   for suffix in ['-main', '-master', '-dev', '-v', '-release']):
-                # Verify this is actually a root
-                if all(m == potential_root.rstrip('/') or m.startswith(potential_root)
-                       for m in members):
-                    return potential_root
-
-    return None
-
-
-def verify_extracted_structure(extract_dir: Path):
-    """
-    Verify the extracted structure contains expected Foundry directories
-    """
-    expected_dirs = ['out', 'broadcast', 'src']
-    found_dirs = []
-    missing_dirs = []
-
-    for dir_name in expected_dirs:
-        dir_path = extract_dir / dir_name
-        if dir_path.exists() and dir_path.is_dir():
-            found_dirs.append(dir_name)
-            print(f"✅ Found Foundry {dir_name}/ directory")
-        else:
-            missing_dirs.append(dir_name)
-
-    if missing_dirs:
-        print(f"⚠️ Warning: Missing expected directories: {missing_dirs}")
-
-        # Debug: Show what was actually extracted
-        print("\n📂 Extracted structure:")
-        for item in extract_dir.iterdir():
-            if item.is_dir():
-                print(f"  📁 {item.name}/")
-                # Show first level of subdirectories
-                try:
-                    # Limit to 5 items
-                    for subitem in list(item.iterdir())[:5]:
-                        if subitem.is_dir():
-                            print(f"    📁 {subitem.name}/")
-                        else:
-                            print(f"    📄 {subitem.name}")
-                except:
-                    pass
-            else:
-                print(f"  📄 {item.name}")
-
-
-def extract_zip_safely(assets_data: bytes, extract_dir: Path) -> bool:
-    """
-    Safely extract ZIP file with better root folder detection and error handling
-    """
-    try:
-        # Log ZIP checksum for debugging
-        zip_hash = hashlib.md5(assets_data).hexdigest()
-        print(f"📊 ZIP MD5: {zip_hash}")
-        print(f"📦 ZIP Size: {len(assets_data)} bytes")
-
-        with zipfile.ZipFile(io.BytesIO(assets_data), 'r') as zf:
-            members = zf.namelist()
-
-            # Filter out __MACOSX files FIRST
-            filtered_members = [
-                m for m in members
-                if not m.startswith('__MACOSX/') and '/__MACOSX/' not in m
-                # Also filter ._ files
-                and not m.startswith('._') and '/._' not in m
-            ]
-
-            print(
-                f"📦 ZIP contains {len(members)} total items ({len(filtered_members)} after filtering __MACOSX)")
-
-            if not filtered_members:
-                print("⚠️ Warning: ZIP file is empty after filtering")
-                return False
-
-            # Log filtered ZIP contents for debugging
-            print(f"📦 Filtered ZIP contents (first 10 items):")
-            for member in filtered_members[:10]:
-                try:
-                    info = zf.getinfo(member)
-                    print(
-                        f"  {info.filename} - {info.file_size} bytes - {'DIR' if info.is_dir() else 'FILE'}")
-                except:
-                    print(f"  {member}")
-            if len(filtered_members) > 10:
-                print(f"  ... and {len(filtered_members) - 10} more items")
-
-            # Better root folder detection using FILTERED members
-            root_folder = detect_root_folder(filtered_members)
-
-            if root_folder:
-                print(f"📁 Detected root folder in ZIP: {root_folder}")
-            else:
-                print("📁 No common root folder detected")
-
-            extracted_count = 0
-            skipped_count = 0
-            failed_count = 0
-            macosx_skipped = len(members) - len(filtered_members)
-
-            for member in members:
-                # Skip __MACOSX files and ._ files
-                if (member.startswith('__MACOSX/') or '/__MACOSX/' in member or
-                        member.startswith('._') or '/._' in member):
-                    continue
-
-                # Skip .DS_Store files
-                if '.DS_Store' in member:
-                    skipped_count += 1
-                    continue
-
-                # Skip the root folder itself
-                if root_folder and (member == root_folder or member == root_folder.rstrip('/')):
-                    skipped_count += 1
-                    continue
-
-                # Calculate the target path
-                if root_folder and member.startswith(root_folder):
-                    # Strip the root folder from the path
-                    relative_path = member[len(root_folder):]
-                    if not relative_path:  # Empty after stripping
-                        skipped_count += 1
-                        continue
-                else:
-                    relative_path = member
-
-                # Security check: prevent directory traversal
-                if '..' in relative_path or relative_path.startswith('/'):
-                    print(f"⚠️ Skipping potentially unsafe path: {member}")
-                    skipped_count += 1
-                    continue
-
-                target_path = extract_dir / relative_path
-
-                # Handle directories
-                if member.endswith('/'):
-                    target_path.mkdir(parents=True, exist_ok=True)
-                    extracted_count += 1
-                else:
-                    # Ensure parent directory exists
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-
-                    # Extract file
-                    try:
-                        with zf.open(member) as source:
-                            content = source.read()
-                            with open(target_path, 'wb') as target:
-                                target.write(content)
-                        extracted_count += 1
-                    except Exception as e:
-                        print(f"⚠️ Failed to extract {member}: {e}")
-                        failed_count += 1
-                        continue
-
-            print(f"✅ Extraction summary:")
-            print(f"   - Successfully extracted: {extracted_count} items")
-            print(f"   - Skipped __MACOSX: {macosx_skipped} items")
-            print(f"   - Skipped other: {skipped_count} items")
-            print(f"   - Failed: {failed_count} items")
-            print(
-                f"   - Total processed: {extracted_count + skipped_count + failed_count}/{len(filtered_members)} (excluding __MACOSX)")
-
-            # Verify expected structure
-            verify_extracted_structure(extract_dir)
-
-            return True
-
-    except zipfile.BadZipFile as e:
-        print(f"❌ Error: Invalid ZIP file - {e}")
-        return False
-    except Exception as e:
-        print(f"❌ Unexpected error during extraction: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
 
 
 class TagParser:
@@ -882,6 +668,7 @@ async def launch_mas_interactive(
     assets_data: bytes,
     job: dict,
     input_handler: Callable,
+    contractList: ContractsList,
     ws_manager=None,
     log_dir: str = "./backend/logs",
     input_queues: Dict[str, asyncio.Queue] = None,
@@ -947,7 +734,8 @@ async def launch_mas_interactive(
     # Get repo name for folder
     repo_name = repo_display_name(github_url)
 
-    # Use a temporary directory for extraction
+    # Log file paths
+    log_file_path = log_path / f"{run_id}_{timestamp}_output.log"
 
     try:
         # Use a temporary directory that auto-deletes when the block ends
@@ -977,6 +765,7 @@ async def launch_mas_interactive(
             output_dir=str(mas_deployments_dir),
             repo_name=repo_name,
             tunnel_url=tunnel_url,
+            contract_list=contractList
         )
 
         print(f"📁 Saved contract assets to MAS: {mas_deployments_dir}")
@@ -1011,9 +800,6 @@ async def launch_mas_interactive(
             env[var_name] = value
 
     cmd = [MAS_PYTHON_PATH, str(mas_script)]
-
-    # Log file paths
-    log_file_path = log_path / f"{run_id}_{timestamp}_output.log"
 
     try:
         print(f"Starting MAS subprocess...")
@@ -1083,7 +869,7 @@ async def launch_mas_interactive(
                     no_output_count += 1
 
                     if time.time() - last_save_time >= SAVE_INTERVAL:
-                        await save_partial_logs_to_firestore(run_id, str(log_file_path), all_output, job)
+                        await save_partial_logs_to_firestore(run_id, str(log_file_path), all_output, contractList, job)
                         last_save_time = time.time()
 
                     current_time = asyncio.get_event_loop().time()
@@ -1666,6 +1452,7 @@ async def save_partial_logs_to_firestore(
     run_id: str,
     log_file_path: str,
     all_output: list,
+    contract_list: ContractsList,
     job: dict  # Add job parameter to get user_id and other info
 ):
     """
@@ -1740,6 +1527,7 @@ async def save_partial_logs_to_firestore(
                 user_id=user_id,
                 user_email=job.get('user_email', ''),
                 run_id=run_id,
+                contract_list=contract_list,
                 log_url=log_url,
                 github_url=github_url,
                 tunnel_url=tunnel_url,
@@ -1759,6 +1547,11 @@ async def save_partial_logs_to_firestore(
                 "github_url": github_url,
                 "tunnel_url": tunnel_url,
                 "session_name": session_name,
+                "contract_list": [
+                    contract.model_dump()
+                    for contract in contract_list.contracts
+                    if contract.is_in_scope
+                ],
                 "status": "running",
                 "updated_at": firestore.SERVER_TIMESTAMP,
                 **metadata
@@ -1766,6 +1559,70 @@ async def save_partial_logs_to_firestore(
             print(f"✅ [PERIODIC] Session document updated")
 
         print(f"✅ [PERIODIC] Saved logs for {run_id} ({file_size} bytes)")
+        return True
+
+    except Exception as e:
+        print(f"❌ [PERIODIC] Failed to save: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+async def save_user_contracts_in_scope(
+    run_id: str,
+    log_file_path: str,
+    contract_list: ContractsList,
+    job: dict  # Add job parameter to get user_id and other info
+):
+    """
+    Periodically save logs to Firebase Storage and update existing session/run documents.
+    Matches the structure of handle_log_upload_and_session.
+    """
+    try:
+        # Extract needed info from job
+        user_id = job.get('user_id', 'unknown')
+        github_url = job.get('github_url', '')
+        tunnel_url = job.get('tunnel_url', '')
+        session_name = job.get('session_name', run_id)
+
+        log_url = None
+
+        # Step 4: Update existing documents (not create new ones)
+        db = get_firestore_client()
+
+        # Update or create session (using save_run_session if you have it)
+        try:
+            tmp = [
+                contract.model_dump()
+                for contract in contract_list.contracts
+                if contract.is_in_scope
+            ]
+            print(f'tmp---------: {tmp}')
+            session_ref = db.collection(
+                "sessions").document(f"{user_id}_{run_id}")
+            session_ref.set({
+                "user_id": user_id,
+                "run_id": run_id,
+                "log_url": log_url,
+                "github_url": github_url,
+                "tunnel_url": tunnel_url,
+                "session_name": session_name,
+                "contracts_in_scope": [
+                    contract.model_dump()
+                    for contract in contract_list.contracts
+                    if contract.is_in_scope
+                ],
+                "status": "running",
+                "updated_at": firestore.SERVER_TIMESTAMP
+            }, merge=True)  # merge=True to update existing
+            print(
+                f"✅ [PERIODIC] Session document updated - save_user_contracts_in_scope")
+
+            print(
+                f"✅ [PERIODIC] Saved logs for {run_id} - save_user_contracts_in_scope")
+        except Exception as e:
+            print(f"❌ [PERIODIC] Failed to save contracts: {e}")
+
         return True
 
     except Exception as e:
