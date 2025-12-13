@@ -28,6 +28,7 @@ def resolve_abi(assets: List[ContractAsset], artifacts: List[Dict[str, Any]]) ->
 
         proxy_type = c.get("proxy_type")
         impl_address = c.get("impl_address")
+        contract_name = c.get("contract_name")
         if not impl_address:
             continue
         impl_address = impl_address.lower()
@@ -41,8 +42,8 @@ def resolve_abi(assets: List[ContractAsset], artifacts: List[Dict[str, Any]]) ->
                 # --- Fetch ABI -------------------------------------------------------
                 try:
                     creation_bytecode_hash = hash_bytecode(creation_bytecode)
-                    new_abi = get_abi(creation_bytecode_hash, artifacts, creation_bytecode = True)
-                    c["abi"] = new_abi
+                    new_abi = get_abi(contract_name, creation_bytecode_hash, artifacts, creation_bytecode = True)
+                    c["impl_abi"] = new_abi
                     continue
 
                 except Exception as e:
@@ -60,13 +61,13 @@ def resolve_abi(assets: List[ContractAsset], artifacts: List[Dict[str, Any]]) ->
                 continue
 
             runtime_hash = keccak(runtime_bytecode).hex()
-            new_abi = get_abi(runtime_hash, artifacts, creation_bytecode = False)
+            new_abi = get_abi(contract_name, runtime_hash, artifacts, creation_bytecode = False)
 
             if not new_abi:
                 c["abi_resolution_error"] = f"artifact_not_found_for_runtime:{impl_address}"
                 continue
 
-            c["abi"] = new_abi
+            c["impl_abi"] = new_abi
 
         except Exception as e:
             c["abi_resolution_error"] = f"eth_getCode_failed:{str(e)}"
@@ -75,7 +76,7 @@ def resolve_abi(assets: List[ContractAsset], artifacts: List[Dict[str, Any]]) ->
     return assets
 
 
-def get_abi(bytecode_hash: str, artifacts: List[Dict[str, Any]], creation_bytecode = True):
+def get_abi(contract_name: str, bytecode_hash: str, artifacts: List[Dict[str, Any]], creation_bytecode = True):
     # Match by bytecode hash
     for artifact in artifacts:
         if creation_bytecode:
@@ -85,8 +86,13 @@ def get_abi(bytecode_hash: str, artifacts: List[Dict[str, Any]], creation_byteco
 
         bytecode_hash_out = hash_bytecode(bytecode_out)
         if bytecode_hash == bytecode_hash_out:
-            return artifact
-        
+            return artifact["abi"]
+    
+    # if we never get a bytecode match, fallback to contract name matching
+    for artifact in artifacts:
+        if artifact["contract_name"] == contract_name:
+            return artifact["abi"]
+
     return None
 
 def hash_bytecode(bytecode: str) -> str:
