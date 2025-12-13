@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any
 from .models.scoped_contracts import ContractsList, Contract
 import shutil
+from eth_utils import to_bytes, keccak
 
 
 def load_foundry_artifacts(base: Path) -> List[Dict[str, Any]]:
@@ -192,12 +193,18 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
         for tx in broadcast_data.get("transactions", []):
             contract_name = tx.get("contractName")
             contract_address = tx.get("contractAddress")
+
+            # get the hashed creation bytecode to improve matching accuracy (Keccak256 hash)
+            creation_bytecode = tx["transaction"]["input"]
+            bytecode_bytes = to_bytes(hexstr=creation_bytecode)
+            bytecode_hash_run_latest = keccak(bytecode_bytes).hex()
+
             if contract_name is None:
                 print(
                     f"contractname is null for transaction with address: {contract_address}")
                 continue
             if contract_name and contract_address:
-                targets[contract_name] = contract_address
+                targets[contract_name] = (contract_address, bytecode_hash_run_latest)
                 deployed_contract_name_list.append(contract_name)
 
         # 2.5) Write non-deployed-contract-in-scope.json summary in repo_path
@@ -229,14 +236,27 @@ def build_contract_assets_to_mas(input_dir: str, output_dir: str, repo_name: str
             f"Created non_deployed_contracts_in_scope file: {non_deployed_path}")
 
     # 3) match deployed contracts to artifacts
-    for label, addr in targets.items():
+    for label, (addr, bytecode_hash_run_latest) in targets.items():
 
-        # Match by contract name instead of bytecode
+        # Try to match by contract creation bytecode first
         art = None
         for artifact in artifacts:
-            if artifact["contract_name"] == label:
+            bytecode_out = artifact["creation"].lstrip("0x")
+            bytecode_bytes_out = to_bytes(hexstr=bytecode_out)
+            bytecode_hash_out = keccak(bytecode_bytes_out).hex()
+            
+            if bytecode_hash_run_latest == bytecode_hash_out:
                 art = artifact
                 break
+
+        if not art:
+            # if we never get a bytecode match, fallback to contract name matching
+            for artifact in artifacts:
+                bytecode_out = artifact["creation"]
+                
+                if artifact["contract_name"] == label:
+                    art = artifact
+                    break
 
         if not art:
             print(f"No artifact found with name {label}")
