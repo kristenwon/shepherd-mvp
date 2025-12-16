@@ -716,7 +716,7 @@ async def launch_mas_interactive(
 
     # Prepare the MAS repository path
     mas_repo = Path(MAS_REPO_PATH).resolve()
-    mas_script = mas_repo / "src" / "api" / "agents" / "mas2.py"
+    mas_script = mas_repo / "src" / "api" / "agents" / "mas" / "mas2.py"
 
     print(f"MAS repo path: {mas_repo}")
     print(f"MAS script path: {mas_script}")
@@ -799,10 +799,10 @@ async def launch_mas_interactive(
         if value is not None:
             env[var_name] = value
 
-    cmd = [MAS_PYTHON_PATH, str(mas_script)]
+    cmd = [MAS_PYTHON_PATH,"-m", "src.api.agents.mas.mas2"]
 
     try:
-        print(f"Starting MAS subprocess...")
+        print("Starting MAS subprocess...")
         print(f"Command: {' '.join(cmd)}")
         print(f"Working directory: {mas_repo}")
 
