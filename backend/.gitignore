@@ -48,3 +48,4 @@ Thumbs.db
 firebase_service_account.json
 /newenv
 test_*.py
+**/tests/
